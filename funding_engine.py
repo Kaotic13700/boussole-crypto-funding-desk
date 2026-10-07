@@ -226,6 +226,7 @@ def fetch_bitget() -> SourceResult:
                 "direction": "positive" if funding_pct >= 0 else "negative",
                 "funding_pct": funding_pct,
                 "predicted_funding_pct": None,
+                "prediction_source": "not-published-by-exchange",
                 "funding_basis": "current",
                 "interval_hours": int(interval),
                 "next_funding_at": deadline,
@@ -241,6 +242,20 @@ def fetch_bitget() -> SourceResult:
                 "market_data_at": market_ts,
                 "market_timestamp_source": "exchange-ticker" if market_ts else "unavailable",
                 "regional_eligibility": "not-applicable",
+                "perp_long_available": True,
+                "perp_short_available": True,
+                "perp_availability_source": "Catalogue Bitget USDT-FUTURES · instrument online",
+                "margin_product_listed": bool(margin_online),
+                "margin_long_source": (
+                    "Catalogue Bitget MARGIN · quote empruntable"
+                    if margin_long
+                    else "Catalogue Bitget MARGIN · quote non empruntable ou paire absente"
+                ),
+                "margin_short_source": (
+                    "Catalogue Bitget MARGIN · base empruntable"
+                    if margin_short
+                    else "Catalogue Bitget MARGIN · base non empruntable ou paire absente"
+                ),
             }
         )
 
@@ -280,13 +295,18 @@ def fetch_kraken() -> SourceResult:
         asset = normalize_asset(wsname.split("/")[0])
         buy_levels = [number for value in pair.get("leverage_buy", []) if (number := finite(value)) is not None]
         sell_levels = [number for value in pair.get("leverage_sell", []) if (number := finite(value)) is not None]
-        existing = margin_by_asset.get(asset, {"long": False, "short": False, "leverage": None})
+        existing = margin_by_asset.get(
+            asset,
+            {"long": False, "short": False, "leverage": None, "long_pairs": [], "short_pairs": []},
+        )
         all_levels = buy_levels + sell_levels
         leverage_candidates = all_levels + ([existing["leverage"]] if existing["leverage"] is not None else [])
         margin_by_asset[asset] = {
             "long": bool(existing["long"] or buy_levels),
             "short": bool(existing["short"] or sell_levels),
             "leverage": max(leverage_candidates) if leverage_candidates else None,
+            "long_pairs": sorted(set(existing["long_pairs"] + ([wsname] if buy_levels else []))),
+            "short_pairs": sorted(set(existing["short_pairs"] + ([wsname] if sell_levels else []))),
         }
 
     try:
@@ -314,7 +334,10 @@ def fetch_kraken() -> SourceResult:
         )
         pair_name = str(ticker.get("pair") or symbol).split(":")[0]
         asset = normalize_asset(pair_name.removeprefix("PF_").removeprefix("PI_").removesuffix("USD"))
-        margin = margin_by_asset.get(asset, {"long": False, "short": False, "leverage": None})
+        margin = margin_by_asset.get(
+            asset,
+            {"long": False, "short": False, "leverage": None, "long_pairs": [], "short_pairs": []},
+        )
         last = finite(ticker.get("last")) or finite(ticker.get("markPrice")) or 0.0
         ask = finite(ticker.get("ask"))
         bid = finite(ticker.get("bid"))
@@ -330,6 +353,7 @@ def fetch_kraken() -> SourceResult:
                 "direction": "positive" if current_pct >= 0 else "negative",
                 "funding_pct": current_pct,
                 "predicted_funding_pct": predicted_pct,
+                "prediction_source": "kraken-fundingRatePrediction" if predicted_pct is not None else "not-published-by-exchange",
                 "funding_basis": "current",
                 "interval_hours": 1,
                 "next_funding_at": next_hour,
@@ -345,6 +369,20 @@ def fetch_kraken() -> SourceResult:
                 "market_data_at": None,
                 "market_timestamp_source": "unavailable",
                 "regional_eligibility": "unverified",
+                "perp_long_available": True,
+                "perp_short_available": True,
+                "perp_availability_source": "Catalogue Kraken Futures · perpetual actif",
+                "margin_product_listed": bool(margin["long"] or margin["short"]),
+                "margin_long_source": (
+                    f"Kraken AssetPairs leverage_buy · {', '.join(margin['long_pairs'])}"
+                    if margin["long"]
+                    else "Kraken AssetPairs · aucun leverage_buy USD"
+                ),
+                "margin_short_source": (
+                    f"Kraken AssetPairs leverage_sell · {', '.join(margin['short_pairs'])}"
+                    if margin["short"]
+                    else "Kraken AssetPairs · aucun leverage_sell USD"
+                ),
             }
         )
 
@@ -425,6 +463,7 @@ def fetch_blofin() -> SourceResult:
                 "direction": "positive" if funding_pct >= 0 else "negative",
                 "funding_pct": funding_pct,
                 "predicted_funding_pct": None,
+                "prediction_source": "not-published-by-exchange",
                 "funding_basis": "current",
                 "interval_hours": int(interval),
                 "next_funding_at": deadline,
@@ -440,6 +479,12 @@ def fetch_blofin() -> SourceResult:
                 "market_data_at": market_ts,
                 "market_timestamp_source": "exchange-ticker" if market_ts else "unavailable",
                 "regional_eligibility": "not-applicable",
+                "perp_long_available": True,
+                "perp_short_available": True,
+                "perp_availability_source": "Catalogue BloFin Futures · instrument live",
+                "margin_product_listed": False,
+                "margin_long_source": "Aucun produit MARGIN vérifiable dans le catalogue public BloFin",
+                "margin_short_source": "Aucun produit MARGIN vérifiable dans le catalogue public BloFin",
             }
         )
 
@@ -547,4 +592,3 @@ def collect_feed() -> dict[str, Any]:
         "latency_ms": fetched_at - started_at,
         "sources": sources,
     }
-
