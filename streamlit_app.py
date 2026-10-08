@@ -648,7 +648,7 @@ def inspect_contract(market: dict[str, Any], coverage: dict[str, dict[str, list[
 @st.fragment(run_every="3s")
 def live_dashboard() -> None:
     feed = load_feed()
-    markets = attach_market_dynamics(feed["markets"])
+    markets = feed["markets"]
     current_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
     coverage = coverage_by_asset(markets)
     logo_index = load_logo_index()
@@ -770,8 +770,8 @@ def live_dashboard() -> None:
                 "Marché": st.column_config.TextColumn("Marché · funding", width=120),
                 "Funding": st.column_config.NumberColumn("Funding", format="%+.6f%%", width=96),
                 "Tranche": st.column_config.NumberColumn("Tranche", format="%d h", width=64),
-                "Open interest": st.column_config.TextColumn("OI · USD · Δ scan", width=130),
-                "Volume 24 h": st.column_config.TextColumn("Volume 24 h · USD · Δ scan", width=142),
+                "Open interest": st.column_config.TextColumn("OI · USD · variation 24 h", width=130),
+                "Volume 24 h": st.column_config.TextColumn("Volume · USD · variation 24 h", width=142),
                 "Compte à rebours": st.column_config.TextColumn("Prochain funding", width=96),
                 "PERP L/S": st.column_config.TextColumn("PERP L/S", width=120),
                 "Margin L/S": st.column_config.TextColumn("Margin L/S", width=140),
@@ -780,8 +780,8 @@ def live_dashboard() -> None:
             },
         )
         st.caption(
-            "Couleurs : vert = hausse depuis le scan précédent, rouge = baisse, gris = stable ou première lecture. "
-            "Les montants Open interest et Volume 24 h sont normalisés en USD à partir des champs officiels. "
+            "Variation 24 h : vert = hausse, rouge = baisse ; — signifie que l’historique vérifié n’est pas disponible. "
+            "Aucune variation entre deux rafraîchissements n’est utilisée. Les montants Open interest et Volume 24 h sont normalisés en USD à partir des champs officiels. "
             "Couverture : BG = Bitget · KR = Kraken EU* · BF = BloFin · L/S = long/short · INV/LIN = contrat inverse/linéaire."
         )
 
