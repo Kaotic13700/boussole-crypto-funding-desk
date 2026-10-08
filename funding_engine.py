@@ -241,6 +241,10 @@ def fetch_bitget() -> SourceResult:
                 "next_funding_at": deadline,
                 "deadline_source": "exchange",
                 "perp_price": last,
+                "bid_price": bid,
+                "ask_price": ask,
+                "mark_price": finite(ticker.get("markPrice")) or last,
+                "contract_value": 1.0,
                 "spread_bps": abs(ask - bid) / mid * 10_000,
                 "margin_long_available": bool(margin_long),
                 "margin_short_available": bool(margin_short),
@@ -362,6 +366,10 @@ def fetch_kraken() -> SourceResult:
                 "next_funding_at": next_hour,
                 "deadline_source": "kraken-server-clock+official-hourly-boundary",
                 "perp_price": last,
+                "bid_price": bid or last,
+                "ask_price": ask or last,
+                "mark_price": finite(ticker.get("markPrice")) or last,
+                "contract_value": 1.0,
                 "spread_bps": abs(ask - bid) / mid * 10_000 if ask and bid else 0.0,
                 "margin_long_available": bool(margin["long"]),
                 "margin_short_available": bool(margin["short"]),
@@ -450,6 +458,10 @@ def fetch_blofin() -> SourceResult:
         if interval not in ALLOWED_INTERVALS:
             continue
         last = finite(ticker.get("last")) or finite(ticker.get("markPrice")) or 0.0
+        contract_value = finite(instrument.get("contractValue"))
+        if contract_value is None or contract_value <= 0:
+            continue
+
         ask = finite(ticker.get("askPrice")) or last
         bid = finite(ticker.get("bidPrice")) or last
         if min(last, ask, bid) <= 0:
@@ -465,6 +477,10 @@ def fetch_blofin() -> SourceResult:
                 "exchange": "BloFin",
                 "direction": "positive" if funding_pct >= 0 else "negative",
                 "funding_pct": funding_pct,
+                "bid_price": bid,
+                "ask_price": ask,
+                "mark_price": finite(ticker.get("markPrice")) or last,
+                "contract_value": contract_value,
                 "predicted_funding_pct": None,
                 "prediction_source": "not-published-by-exchange",
                 "funding_basis": "current",

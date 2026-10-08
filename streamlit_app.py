@@ -13,7 +13,17 @@ import pandas as pd
 import streamlit as st
 
 from funding_engine import collect_feed, market_state
-from paper_engine import build_perp_routes, mark_paper_position
+from paper_engine import (
+    DEFAULT_TAKER_FEE_PCT,
+    apply_confirmed_settlements,
+    build_perp_routes,
+    close_paper_position,
+    mark_paper_position,
+    open_paper_position,
+    vwap_for_notional,
+    vwap_for_quantity,
+)
+from paper_market_data import fetch_confirmed_settlements, fetch_order_book, fetch_order_books
 
 
 ROOT = Path(__file__).resolve().parent
@@ -171,6 +181,17 @@ st.markdown(
 @st.cache_data(ttl=2.4, max_entries=1, show_spinner=False)
 def load_feed() -> dict[str, Any]:
     return collect_feed()
+
+@st.cache_data(ttl=1.2, max_entries=64, show_spinner=False)
+def load_order_book(exchange: str, symbol: str, contract_value: float) -> dict[str, Any]:
+    return fetch_order_book(exchange, symbol, contract_value)
+
+
+@st.cache_data(ttl=30, max_entries=256, show_spinner=False)
+def load_confirmed_settlements(
+    exchange: str, symbol: str, since_ms: int, until_bucket_ms: int
+) -> list[dict[str, Any]]:
+    return fetch_confirmed_settlements(exchange, symbol, since_ms, until_bucket_ms)
 
 
 @st.cache_data(ttl=3_600, max_entries=1, show_spinner=False)
@@ -615,7 +636,7 @@ def route_label(route: dict[str, Any]) -> str:
     funding_venue = VENUE_LABELS[route["funding_exchange"]]
     hedge_venue = VENUE_LABELS[route["hedge_exchange"]]
     return (
-        f"{route['asset']} · {route['funding_pct']:+.4f}%/{route['interval_hours']} h · "
+        f"{route['asset']} · signal {route['funding_pct']:+.4f}%/{route['interval_hours']} h · net fenêtre {route['net_funding_pct']:+.4f}% · "
         f"{route['funding_side'].upper()} {funding_venue} ↔ {route['hedge_side'].upper()} {hedge_venue}"
     )
 
@@ -627,24 +648,138 @@ def demo_dashboard() -> None:
     markets_by_id = {market["id"]: market for market in markets}
     routes = build_perp_routes(markets, threshold_pct=0.4)
     positions = st.session_state.setdefault("paper_positions", [])
+    closed_positions = st.session_state.setdefault("paper_closed_positions", [])
+    current_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    until_bucket_ms = current_ms // 30_000 * 30_000
+
+    initial_balance = float(st.session_state.setdefault("paper_initial_balance", 10_000.0))
+    with st.expander("Paramètres réalistes de la démo", expanded=False):
+        if not positions and not closed_positions:
+            balance_input = st.number_input(
+                "Capital fictif initial ($)",
+                min_value=1_000.0,
+                max_value=1_000_000.0,
+                value=initial_balance,
+                step=1_000.0,
+                key="paper_initial_balance_input",
+            )
+            st.session_state.paper_initial_balance = float(balance_input)
+            initial_balance = float(balance_input)
+        else:
+            st.caption(f"Capital initial verrouillé pendant le journal en cours : USD {initial_balance:,.2f}")
+        st.caption(
+            "Profil taker standard public. Ajustez ces taux avec les frais réellement appliqués à votre compte ; "
+            "chaque position conserve le profil actif lors de son ouverture."
+        )
+        fee_columns = st.columns(3)
+        fee_rates: dict[str, float] = {}
+        for column, exchange in zip(fee_columns, ("Bitget", "Kraken", "BloFin")):
+            with column:
+                fee_rates[exchange] = float(
+                    st.number_input(
+                        f"{VENUE_LABELS[exchange]} · taker %",
+                        min_value=0.0,
+                        max_value=1.0,
+                        value=float(DEFAULT_TAKER_FEE_PCT[exchange]),
+                        step=0.005,
+                        format="%.4f",
+                        key=f"paper_fee_{exchange}",
+                    )
+                )
+
+    settlement_errors: list[str] = []
+    kraken_positions = False
+    for position in positions:
+        for leg in ("funding", "hedge"):
+            exchange = position[f"{leg}_exchange"]
+            if exchange == "Kraken":
+                kraken_positions = True
+                continue
+            deadline_key = "next_funding_at" if leg == "funding" else "hedge_next_funding_at"
+            if current_ms < int(position.get(deadline_key) or current_ms + 1):
+                continue
+            try:
+                events = load_confirmed_settlements(
+                    exchange,
+                    position[f"{leg}_symbol"],
+                    int(position["opened_at"]),
+                    until_bucket_ms,
+                )
+                apply_confirmed_settlements(position, leg, events)
+            except Exception as error:
+                settlement_errors.append(f"{exchange} {position[f'{leg}_symbol']} : {error}")
+
+    for position in closed_positions:
+        for leg in ("funding", "hedge"):
+            exchange = position[f"{leg}_exchange"]
+            if exchange == "Kraken":
+                kraken_positions = True
+                continue
+            deadline_key = "next_funding_at" if leg == "funding" else "hedge_next_funding_at"
+            if int(position["closed_at"]) < int(position.get(deadline_key) or 0):
+                continue
+            try:
+                symbol = position[f"{leg}_symbol"]
+                events = load_confirmed_settlements(
+                    exchange,
+                    symbol,
+                    int(position["opened_at"]),
+                    int(position["closed_at"]),
+                )
+                if apply_confirmed_settlements(position, leg, events):
+                    confirmed = sum(
+                        float(event["cashflow"])
+                        for event in position.get("confirmed_funding_events", [])
+                    )
+                    position["confirmed_funding"] = confirmed
+                    position["net_result"] = (
+                        float(position["market_pnl"])
+                        + confirmed
+                        - float(position["entry_fee"])
+                        - float(position["exit_fee"])
+                    )
+            except Exception as error:
+                settlement_errors.append(f"{exchange} {symbol} : {error}")
+
+
+    marked_by_id: dict[str, dict[str, float] | None] = {
+        position["position_id"]: mark_paper_position(position, markets_by_id)
+        for position in positions
+    }
+    realized_result = sum(float(position["net_result"]) for position in closed_positions)
+    unrealized_result = sum(
+        float(marked["net_if_closed"])
+        for marked in marked_by_id.values()
+        if marked is not None
+    )
+    margin_used = sum(float(position["margin_required"]) for position in positions)
+    equity = initial_balance + realized_result + unrealized_result
+    available_margin = equity - margin_used
 
     st.markdown('<div class="bc-section-label">Portefeuille de démonstration · marché réel</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="bc-paper"><strong>Mode paper live</strong><br>'
-        '<span style="color:#9da7a1;font-size:.78rem">Les deux jambes utilisent exclusivement les prix PERP live du scanner. '
-        'Aucun ordre, aucune clé API et aucun prix fictif. Le funding affiché reste une projection jusqu’au règlement effectif.</span></div>',
+        '<div class="bc-paper"><strong>Données de marché strictes · capital paper</strong><br>'
+        '<span style="color:#9da7a1;font-size:.78rem">Capital fictif uniquement. Entrées au VWAP des carnets publics, '
+        'sorties valorisées au bid/ask, frais taker intégrés et fundings Bitget/BloFin crédités après confirmation officielle. '
+        'Aucun ordre réel et aucune clé privée.</span></div>',
         unsafe_allow_html=True,
     )
+    st.caption(
+        "Limite volontaire : la liquidation exacte dépend du mode de marge, du tier et du collatéral du compte. "
+        "Elle n’est pas simulée sans connecteur de compte en lecture seule ; aucune estimation n’est présentée comme exacte."
+    )
 
-    status_cols = st.columns(4)
+    status_cols = st.columns(5)
     with status_cols[0]:
-        metric_card("Routes live ≥ ±0,40%", str(len(routes)), "PERP / PERP vérifiées", "watch")
+        metric_card("Routes ≥ ±0,40%", str(len(routes)), "Surveillance live", "watch")
     with status_cols[1]:
-        metric_card("Positions démo", str(len(positions)), "État de session local")
+        metric_card("Positions", str(len(positions)), "Journal de session")
     with status_cols[2]:
-        metric_card("Exécution réelle", "OFF", "Verrouillée par conception")
+        metric_card("Équité paper estimée", f"USD {equity:,.2f}", f"Réalisé {realized_result:+.2f} USD")
     with status_cols[3]:
-        metric_card("Mobile", "READY", "Interface responsive · alertes in-app")
+        metric_card("Marge disponible", f"USD {available_margin:,.2f}", f"Utilisée {margin_used:,.2f} USD")
+    with status_cols[4]:
+        metric_card("Exécution réelle", "OFF", "Verrouillée par conception")
 
     st.markdown('<div class="bc-section-label">Prise de décision</div>', unsafe_allow_html=True)
     if not routes:
@@ -661,36 +796,156 @@ def demo_dashboard() -> None:
         controls = st.columns([1, 1, 1.25])
         with controls[0]:
             total_notional = st.number_input(
-                "Notionnel global ($)", min_value=200.0, max_value=100_000.0, value=4_000.0, step=200.0
+                "Notionnel global ($)",
+                min_value=200.0,
+                max_value=100_000.0,
+                value=4_000.0,
+                step=200.0,
+                key="paper_notional",
             )
         with controls[1]:
-            leverage = st.select_slider("Levier indicatif", options=list(range(3, 11)), value=6)
-        with controls[2]:
-            st.caption("Le levier ne déclenche jamais l’entrée ; le seuil reste uniquement le funding ±0,40/0,50%.")
-        if st.button("Ouvrir les deux jambes en démo live", type="primary", use_container_width=True):
-            positions.append(
-                {
-                    **route,
-                    "leg_notional": float(total_notional) / 2,
-                    "total_notional": float(total_notional),
-                    "leverage": int(leverage),
-                    "opened_at": int(datetime.now(tz=timezone.utc).timestamp() * 1000),
-                }
+            leverage = st.select_slider(
+                "Levier de marge", options=list(range(3, 11)), value=6, key="paper_leverage"
             )
-            st.toast(f"Position démo ouverte · {route['asset']} · 2 × ${total_notional / 2:,.0f}", icon="🧭")
+        with controls[2]:
+            st.caption(
+                "Le levier dimensionne uniquement la marge. Entrée autorisée à ±0,50 % ; "
+                "la zone ±0,40–0,50 % reste une surveillance."
+            )
+
+        books: dict[str, dict[str, Any]] = {}
+        execution_error: str | None = None
+        funding_fill: dict[str, float] | None = None
+        hedge_fill: dict[str, float] | None = None
+        try:
+            books = {
+                "funding": load_order_book(
+                    route["funding_exchange"],
+                    route["funding_symbol"],
+                    route["funding_contract_value"],
+                ),
+                "hedge": load_order_book(
+                    route["hedge_exchange"],
+                    route["hedge_symbol"],
+                    route["hedge_contract_value"],
+                ),
+            }
+            funding_fill = vwap_for_notional(
+                books["funding"], route["funding_side"], float(total_notional) / 2
+            )
+            hedge_fill = vwap_for_notional(
+                books["hedge"], route["hedge_side"], float(total_notional) / 2
+            )
+        except Exception as error:
+            execution_error = str(error)
+
+        entry_fee_preview = None
+        if funding_fill is not None and hedge_fill is not None:
+            entry_fee_preview = (
+                funding_fill["notional"] * fee_rates[route["funding_exchange"]]
+                + hedge_fill["notional"] * fee_rates[route["hedge_exchange"]]
+            ) / 100
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Signal": route["funding_pct"],
+                            "Funding couverture": route["hedge_funding_pct"],
+                            "Impact couverture fenêtre": route["hedge_capture_cashflow_pct"],
+                            "Funding net fenêtre": route["net_funding_pct"],
+                            "Tranche signal": route["interval_hours"],
+                            "Échéance signal UTC": datetime.fromtimestamp(
+                                route["next_funding_at"] / 1000, tz=timezone.utc
+                            ),
+                            "Tranche couverture": route["hedge_interval_hours"],
+                            "Échéance couverture UTC": datetime.fromtimestamp(
+                                route["hedge_next_funding_at"] / 1000, tz=timezone.utc
+                            ),
+                            "VWAP jambe funding": funding_fill["price"],
+                            "Slippage funding": funding_fill["slippage_bps"],
+                            "VWAP couverture": hedge_fill["price"],
+                            "Slippage couverture": hedge_fill["slippage_bps"],
+                            "Frais entrée": entry_fee_preview,
+                        }
+                    ]
+                ),
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "Signal": st.column_config.NumberColumn("Funding signal", format="%+.6f%%"),
+                    "Funding couverture": st.column_config.NumberColumn(format="%+.6f%%"),
+                    "Impact couverture fenêtre": st.column_config.NumberColumn(format="%+.6f%%"),
+                    "Funding net fenêtre": st.column_config.NumberColumn(format="%+.6f%%"),
+                    "Tranche signal": st.column_config.NumberColumn(format="%d h"),
+                    "Échéance signal UTC": st.column_config.DatetimeColumn(format="DD/MM/YYYY HH:mm:ss"),
+                    "Tranche couverture": st.column_config.NumberColumn(format="%d h"),
+                    "Échéance couverture UTC": st.column_config.DatetimeColumn(format="DD/MM/YYYY HH:mm:ss"),
+                    "VWAP jambe funding": st.column_config.NumberColumn(format="%.8f"),
+                    "Slippage funding": st.column_config.NumberColumn(format="%.2f bps"),
+                    "VWAP couverture": st.column_config.NumberColumn(format="%.8f"),
+                    "Slippage couverture": st.column_config.NumberColumn(format="%.2f bps"),
+                    "Frais entrée": st.column_config.NumberColumn(format="$%.2f"),
+                },
+            )
+
+        signal_ready = abs(float(route["funding_pct"])) >= 0.5
+        required_cash = float(total_notional) / int(leverage) + float(entry_fee_preview or 0)
+        capital_ready = required_cash <= available_margin
+        can_open = signal_ready and execution_error is None and capital_ready
+        if not signal_ready:
+            st.warning("Surveillance renforcée uniquement : le signal n’a pas encore atteint ±0,50 %.")
+        if execution_error:
+            st.error(f"Ouverture bloquée : {execution_error}")
+        if not capital_ready:
+            st.error(
+                f"Ouverture bloquée : marge + frais requis USD {required_cash:,.2f}, "
+                f"disponible USD {available_margin:,.2f}."
+            )
+        if st.button(
+            "Ouvrir les deux jambes au carnet live",
+            type="primary",
+            use_container_width=True,
+            disabled=not can_open,
+        ):
+            try:
+                execution_books = fetch_order_books(
+                    {
+                        "funding": (
+                            route["funding_exchange"],
+                            route["funding_symbol"],
+                            route["funding_contract_value"],
+                        ),
+                        "hedge": (
+                            route["hedge_exchange"],
+                            route["hedge_symbol"],
+                            route["hedge_contract_value"],
+                        ),
+                    }
+                )
+                opened_at = max(int(book["timestamp"]) for book in execution_books.values())
+                position = open_paper_position(
+                    route,
+                    float(total_notional),
+                    int(leverage),
+                    fee_rates,
+                    execution_books,
+                    opened_at,
+                    f"{opened_at}:{route['id']}",
+                )
+                positions.append(position)
+                st.toast(
+                    f"Position paper ouverte · {route['asset']} · 2 × USD {total_notional / 2:,.0f}",
+                    icon="🧭",
+                )
+                st.rerun(scope="fragment")
+            except Exception as error:
+                st.error(f"Ouverture bloquée au contrôle final : {error}")
 
     if positions:
         st.markdown('<div class="bc-section-label">Positions suivies sur le flux live</div>', unsafe_allow_html=True)
         marked_rows: list[dict[str, Any]] = []
         for index, position in enumerate(positions, start=1):
-            marked = mark_paper_position(position, markets_by_id)
-            if marked is None:
-                status = "FLUX INDISPONIBLE"
-                market_pnl = projected = None
-            else:
-                status = "LIVE"
-                market_pnl = marked["market_pnl"]
-                projected = marked["projected_next_funding"]
+            marked = marked_by_id[position["position_id"]]
             marked_rows.append(
                 {
                     "#": index,
@@ -699,9 +954,14 @@ def demo_dashboard() -> None:
                     "Jambe couverture": f"{position['hedge_side'].upper()} · {VENUE_LABELS[position['hedge_exchange']]}",
                     "Notionnel": position["total_notional"],
                     "Levier": position["leverage"],
-                    "PnL marché": market_pnl,
-                    "Funding prochain cycle": projected,
-                    "Statut": status,
+                    "Marge": position["margin_required"],
+                    "PnL marché": None if marked is None else marked["market_pnl"],
+                    "Funding confirmé": None if marked is None else marked["confirmed_funding"],
+                    "Funding net projeté": None if marked is None else marked["projected_net_funding"],
+                    "Frais entrée": position["entry_fee"],
+                    "Frais sortie estimés": None if marked is None else marked["estimated_exit_fee"],
+                    "Net si clôture": None if marked is None else marked["net_if_closed"],
+                    "Statut": "LIVE" if marked is not None else "FLUX INDISPONIBLE",
                 }
             )
         st.dataframe(
@@ -709,15 +969,98 @@ def demo_dashboard() -> None:
             width="stretch",
             hide_index=True,
             column_config={
-                "Notionnel": st.column_config.NumberColumn("Notionnel global", format="$%.2f"),
-                "Levier": st.column_config.NumberColumn("Levier", format="x%d"),
-                "PnL marché": st.column_config.NumberColumn("PnL marché live", format="$%+.2f"),
-                "Funding prochain cycle": st.column_config.NumberColumn("Funding projeté", format="$%.2f"),
+                "Notionnel": st.column_config.NumberColumn(format="$%.2f"),
+                "Levier": st.column_config.NumberColumn(format="x%d"),
+                "Marge": st.column_config.NumberColumn(format="$%.2f"),
+                "PnL marché": st.column_config.NumberColumn(format="$%+.2f"),
+                "Funding confirmé": st.column_config.NumberColumn(format="$%+.2f"),
+                "Funding net projeté": st.column_config.NumberColumn(format="$%+.2f"),
+                "Frais entrée": st.column_config.NumberColumn(format="$%.2f"),
+                "Frais sortie estimés": st.column_config.NumberColumn(format="$%.2f"),
+                "Net si clôture": st.column_config.NumberColumn(format="$%+.2f"),
             },
         )
-        if st.button("Clôturer toutes les positions démo", use_container_width=True):
-            st.session_state.paper_positions = []
-            st.rerun(scope="fragment")
+
+        position_by_id = {position["position_id"]: position for position in positions}
+        close_id = st.selectbox(
+            "Position à clôturer",
+            list(position_by_id),
+            format_func=lambda identifier: (
+                f"{position_by_id[identifier]['asset']} · "
+                f"{VENUE_LABELS[position_by_id[identifier]['funding_exchange']]} / "
+                f"{VENUE_LABELS[position_by_id[identifier]['hedge_exchange']]}"
+            ),
+            key="paper_close_position",
+        )
+        if st.button("Clôturer les deux jambes au carnet live", use_container_width=True):
+            position = position_by_id[close_id]
+            try:
+                close_books = fetch_order_books(
+                    {
+                        "funding": (
+                            position["funding_exchange"],
+                            position["funding_symbol"],
+                            position["funding_contract_value"],
+                        ),
+                        "hedge": (
+                            position["hedge_exchange"],
+                            position["hedge_symbol"],
+                            position["hedge_contract_value"],
+                        ),
+                    }
+                )
+                closed_at = max(int(book["timestamp"]) for book in close_books.values())
+                closed = close_paper_position(position, close_books, closed_at)
+                closed_positions.append(closed)
+                st.session_state.paper_positions = [
+                    item for item in positions if item["position_id"] != close_id
+                ]
+                st.toast(
+                    f"Position paper clôturée · net {closed['net_result']:+.2f} USD",
+                    icon="✅",
+                )
+                st.rerun(scope="fragment")
+            except Exception as error:
+                st.error(f"Clôture bloquée : {error}")
+
+    if settlement_errors:
+        st.warning("Certains règlements n’ont pas encore pu être confirmés : " + " | ".join(set(settlement_errors)))
+    if kraken_positions:
+        st.info(
+            "Kraken : le PnL et les frais sont suivis live, mais le funding réalisé n’est pas crédité sans "
+            "historique de compte authentifié en lecture seule. Aucune valeur n’est inventée."
+        )
+
+    if closed_positions:
+        st.markdown('<div class="bc-section-label">Journal des positions clôturées</div>', unsafe_allow_html=True)
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Actif": position["asset"],
+                        "Ouverture UTC": datetime.fromtimestamp(position["opened_at"] / 1000, tz=timezone.utc),
+                        "Clôture UTC": datetime.fromtimestamp(position["closed_at"] / 1000, tz=timezone.utc),
+                        "PnL marché": position["market_pnl"],
+                        "Funding confirmé": position["confirmed_funding"],
+                        "Frais entrée": position["entry_fee"],
+                        "Frais sortie": position["exit_fee"],
+                        "Résultat net": position["net_result"],
+                    }
+                    for position in reversed(closed_positions)
+                ]
+            ),
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Ouverture UTC": st.column_config.DatetimeColumn(format="DD/MM/YYYY HH:mm:ss"),
+                "Clôture UTC": st.column_config.DatetimeColumn(format="DD/MM/YYYY HH:mm:ss"),
+                "PnL marché": st.column_config.NumberColumn(format="$%+.2f"),
+                "Funding confirmé": st.column_config.NumberColumn(format="$%+.2f"),
+                "Frais entrée": st.column_config.NumberColumn(format="$%.2f"),
+                "Frais sortie": st.column_config.NumberColumn(format="$%.2f"),
+                "Résultat net": st.column_config.NumberColumn(format="$%+.2f"),
+            },
+        )
 
     st.markdown('<div class="bc-section-label">Connexion portefeuille</div>', unsafe_allow_html=True)
     connection_cols = st.columns([1, 2])
@@ -725,8 +1068,8 @@ def demo_dashboard() -> None:
         st.button("Connexion réelle verrouillée", disabled=True, use_container_width=True)
     with connection_cols[1]:
         st.caption(
-            "L’interface est prête à recevoir des connecteurs d’exchange. L’activation réelle exigera une validation séparée, "
-            "des clés sans droit de retrait, un chiffrement des secrets et un kill switch serveur."
+            "Aucune clé n’est demandée. L’étape suivante nécessitera votre validation explicite et commencera "
+            "par des accès lecture seule, sans retrait ni exécution."
         )
 
 
