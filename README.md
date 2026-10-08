@@ -4,6 +4,7 @@ Application Streamlit de surveillance des fundings perpétuels Bitget, Kraken et
 
 ## Fonctionnement
 
+- Open interest et volume 24 h issus des API officielles, normalisés en USD et colorés selon leur variation entre deux scans.
 - Feed public officiel des PERP 1 h, 4 h et 8 h.
 - Alerte à partir de `±0,50 %` et surveillance renforcée à partir de `±0,40 %`.
 - Funding courant Kraken séparé de sa prévision.

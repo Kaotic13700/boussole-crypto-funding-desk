@@ -1,6 +1,7 @@
 import pytest
 
 from funding_engine import (
+    kraken_open_interest_usd,
     kraken_published_relative_pct,
     kraken_relative_funding_pct,
     market_state,
@@ -21,6 +22,13 @@ def test_kraken_published_relative_rate_is_used_directly() -> None:
     ticker = {"relativeFundingRate": 0.00123, "fundingRate": 999}
     assert kraken_published_relative_pct(ticker, "relativeFundingRate") == pytest.approx(0.123)
     assert kraken_published_relative_pct(ticker, "relativeFundingRatePrediction") is None
+
+
+def test_kraken_open_interest_normalization() -> None:
+    assert kraken_open_interest_usd("PI_XBTUSD", 2_000_000, 80_000) == pytest.approx(2_000_000)
+    assert kraken_open_interest_usd("PF_XBTUSD", 10, 80_000) == pytest.approx(800_000)
+    assert kraken_open_interest_usd("PF_XBTUSD", None, 80_000) is None
+
 
 
 def test_thresholds_do_not_depend_on_leverage() -> None:

@@ -116,6 +116,17 @@ def kraken_published_relative_pct(ticker: dict[str, Any], field: str) -> float |
     return rate * 100
 
 
+def kraken_open_interest_usd(
+    symbol: str, open_interest: float | None, mark_price: float
+) -> float | None:
+    if open_interest is None or open_interest < 0 or mark_price <= 0:
+        return None
+    if symbol.startswith("PI_"):
+        return open_interest
+    return open_interest * mark_price
+
+
+
 def _client() -> httpx.Client:
     return httpx.Client(
         timeout=HTTP_TIMEOUT_SECONDS,
@@ -225,6 +236,10 @@ def fetch_bitget() -> SourceResult:
             None,
         )
         funding_pct = rate * 100
+        mark_price = finite(ticker.get("markPrice")) or last
+        volume_24h_usd = finite(ticker.get("turnover24h"))
+        open_interest = finite(ticker.get("openInterest"))
+        open_interest_usd = None if open_interest is None else open_interest * mark_price
         markets.append(
             {
                 "id": f"bitget-{symbol.lower()}",
@@ -243,13 +258,17 @@ def fetch_bitget() -> SourceResult:
                 "perp_price": last,
                 "bid_price": bid,
                 "ask_price": ask,
-                "mark_price": finite(ticker.get("markPrice")) or last,
+                "mark_price": mark_price,
                 "contract_value": 1.0,
                 "spread_bps": abs(ask - bid) / mid * 10_000,
                 "margin_long_available": bool(margin_long),
                 "margin_short_available": bool(margin_short),
                 "max_margin_leverage": max_leverage,
-                "depth_usd": finite(ticker.get("turnover24h")) or 0.0,
+                "depth_usd": volume_24h_usd or 0.0,
+                "open_interest_usd": open_interest_usd,
+                "open_interest_native": open_interest,
+                "volume_24h_native": volume_24h_usd,
+                "volume_24h_usd": volume_24h_usd,
                 "data_status": "live",
                 "updated_at": received_at,
                 "market_data_at": market_ts,
@@ -350,6 +369,10 @@ def fetch_kraken() -> SourceResult:
         if last <= 0:
             continue
         mid = (ask + bid) / 2 if ask and bid else last
+        mark_price = finite(ticker.get("markPrice")) or last
+        volume_24h_usd = finite(ticker.get("volumeQuote"))
+        open_interest = finite(ticker.get("openInterest"))
+        open_interest_usd = kraken_open_interest_usd(symbol, open_interest, mark_price)
         markets.append(
             {
                 "id": f"kraken-{symbol.lower()}",
@@ -368,13 +391,17 @@ def fetch_kraken() -> SourceResult:
                 "perp_price": last,
                 "bid_price": bid or last,
                 "ask_price": ask or last,
-                "mark_price": finite(ticker.get("markPrice")) or last,
+                "mark_price": mark_price,
                 "contract_value": 1.0,
                 "spread_bps": abs(ask - bid) / mid * 10_000 if ask and bid else 0.0,
                 "margin_long_available": bool(margin["long"]),
                 "margin_short_available": bool(margin["short"]),
                 "max_margin_leverage": margin["leverage"],
-                "depth_usd": finite(ticker.get("volumeQuote")) or 0.0,
+                "depth_usd": volume_24h_usd or 0.0,
+                "open_interest_usd": open_interest_usd,
+                "open_interest_native": open_interest,
+                "volume_24h_native": volume_24h_usd,
+                "volume_24h_usd": volume_24h_usd,
                 "data_status": "live",
                 "updated_at": received_at,
                 "market_data_at": None,
@@ -418,12 +445,14 @@ def fetch_blofin() -> SourceResult:
                 "instruments": f"{base}/api/v1/market/instruments",
                 "tickers": f"{base}/api/v1/market/tickers",
                 "funding": f"{base}/api/v1/market/funding-rate",
+                "open_interest": f"{base}/api/v1/market/open-interest",
             },
         )
     for key, label in (
         ("instruments", "BloFin instruments"),
         ("tickers", "BloFin tickers"),
         ("funding", "BloFin funding"),
+        ("open_interest", "BloFin open interest"),
     ):
         assert_business_success(payloads[key], label, "0")
 
@@ -431,6 +460,8 @@ def fetch_blofin() -> SourceResult:
     tickers = require_list(payloads["tickers"].get("data"), "BloFin tickers")
     funding_rows = require_list(payloads["funding"].get("data"), "BloFin funding")
     instrument_by_id = {row.get("instId"): row for row in instruments if row.get("state") == "live"}
+    open_interest_rows = require_list(payloads["open_interest"].get("data"), "BloFin open interest")
+    open_interest_by_id = {row.get("instId"): row for row in open_interest_rows}
     ticker_by_id = {row.get("instId"): row for row in tickers}
     received_at = now_ms()
     markets: list[dict[str, Any]] = []
@@ -469,6 +500,12 @@ def fetch_blofin() -> SourceResult:
         mid = (ask + bid) / 2
         market_ts = timestamp_ms(ticker.get("ts"))
         funding_pct = rate * 100
+        mark_price = finite(ticker.get("markPrice")) or last
+        volume_24h_native = finite(ticker.get("volCurrency24h"))
+        volume_24h_usd = (volume_24h_native or 0.0) * mark_price
+        open_interest_row = open_interest_by_id.get(instrument_id) or {}
+        open_interest_currency = finite(open_interest_row.get("openInterestCurrency"))
+        open_interest_usd = None if open_interest_currency is None else open_interest_currency * mark_price
         markets.append(
             {
                 "id": f"blofin-{instrument_id.lower()}",
@@ -479,7 +516,7 @@ def fetch_blofin() -> SourceResult:
                 "funding_pct": funding_pct,
                 "bid_price": bid,
                 "ask_price": ask,
-                "mark_price": finite(ticker.get("markPrice")) or last,
+                "mark_price": mark_price,
                 "contract_value": contract_value,
                 "predicted_funding_pct": None,
                 "prediction_source": "not-published-by-exchange",
@@ -493,7 +530,11 @@ def fetch_blofin() -> SourceResult:
                 "margin_long_available": False,
                 "margin_short_available": False,
                 "max_margin_leverage": finite(instrument.get("maxLeverage")),
-                "depth_usd": (finite(ticker.get("volCurrency24h")) or 0.0) * last,
+                "depth_usd": volume_24h_usd,
+                "open_interest_usd": open_interest_usd,
+                "open_interest_native": open_interest_currency,
+                "volume_24h_native": volume_24h_native,
+                "volume_24h_usd": volume_24h_usd,
                 "data_status": "live",
                 "updated_at": received_at,
                 "market_data_at": market_ts,

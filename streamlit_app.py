@@ -363,6 +363,75 @@ def deadline_source_label(market: dict[str, Any]) -> str:
         return "Kraken · horloge serveur + borne horaire officielle"
     return "Source indisponible"
 
+def relative_change_pct(current: Any, previous: Any) -> float | None:
+    try:
+        current_value = float(current)
+        previous_value = float(previous)
+    except (TypeError, ValueError):
+        return None
+    if previous_value <= 0:
+        return None
+    return (current_value - previous_value) / previous_value * 100
+
+
+def attach_market_dynamics(markets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    previous = st.session_state.get("market_metric_snapshot", {})
+    current_snapshot: dict[str, dict[str, float | None]] = {}
+    enriched: list[dict[str, Any]] = []
+    for market in markets:
+        open_interest = market.get("open_interest_usd")
+        volume = market.get("volume_24h_usd")
+        open_interest_reference = market.get("open_interest_native")
+        volume_reference = market.get("volume_24h_native")
+        prior = previous.get(market["id"], {})
+        item = {
+            **market,
+            "open_interest_change_pct": (
+                relative_change_pct(open_interest_reference, prior.get("open_interest_native"))
+                if market.get("data_status") == "live"
+                else None
+            ),
+            "volume_24h_change_pct": (
+                relative_change_pct(volume_reference, prior.get("volume_24h_native"))
+                if market.get("data_status") == "live"
+                else None
+            ),
+        }
+        enriched.append(item)
+        if market.get("data_status") == "live":
+            current_snapshot[market["id"]] = {
+                "open_interest_native": open_interest_reference,
+                "volume_24h_native": volume_reference,
+            }
+    st.session_state.market_metric_snapshot = current_snapshot
+    return enriched
+
+
+def compact_usd(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    absolute = abs(number)
+    for divisor, suffix in ((1_000_000_000, "Md$"), (1_000_000, "M$"), (1_000, "k$")):
+        if absolute >= divisor:
+            return f"{number / divisor:,.2f} {suffix}".replace(",", " ")
+    return f"{number:,.0f} $".replace(",", " ")
+
+
+def movement_html(value: Any, change_pct: Any) -> str:
+    try:
+        change = float(change_pct)
+    except (TypeError, ValueError):
+        return f'<span style="color:#a1aaa5">{compact_usd(value)}</span>'
+    if change > 0:
+        return f'<span style="color:#67e2b0">▲ {compact_usd(value)} · {change:+.3f}%</span>'
+    if change < 0:
+        return f'<span style="color:#ff867d">▼ {compact_usd(value)} · {change:+.3f}%</span>'
+    return f'<span style="color:#a1aaa5">● {compact_usd(value)} · stable</span>'
+
+
+
 
 
 def table_rows(
@@ -381,10 +450,12 @@ def table_rows(
                 "Actif": market["asset"],
                 "Funding": market["funding_pct"],
                 "Tranche": market["interval_hours"],
-                "Échéance": datetime.fromtimestamp(market["next_funding_at"] / 1000, tz=timezone.utc),
+                "Open interest": market.get("open_interest_usd"),
+                "_OI variation": market.get("open_interest_change_pct"),
+                "Volume 24 h": market.get("volume_24h_usd"),
+                "_Volume variation": market.get("volume_24h_change_pct"),
                 "Compte à rebours": countdown(market["next_funding_at"], current_ms),
                 "Source échéance": deadline_source_label(market),
-                "Signal": "SHORT PERP reçoit" if market["funding_pct"] > 0 else "LONG PERP reçoit",
                 "PERP long": availability_text(asset_coverage["perp_long"]),
                 "PERP short": availability_text(asset_coverage["perp_short"]),
                 "Margin long": availability_text(asset_coverage["margin_long"]),
@@ -425,7 +496,33 @@ def styled_market_frame(frame: pd.DataFrame) -> Any:
             else "color:#7d8580;background-color:rgba(125,133,128,.045)"
         )
 
-    styler = frame.style.map(state_style, subset=["État"]).map(funding_style, subset=["Funding"])
+    def trend_style(change: Any) -> str:
+        try:
+            number = float(change)
+        except (TypeError, ValueError):
+            return "color:#a1aaa5;background-color:rgba(161,170,165,.04)"
+        if number > 0:
+            return "color:#67e2b0;background-color:rgba(50,213,154,.08);font-weight:780"
+        if number < 0:
+            return "color:#ff867d;background-color:rgba(255,105,94,.08);font-weight:780"
+        return "color:#a1aaa5;background-color:rgba(161,170,165,.04)"
+
+    oi_changes = frame["_OI variation"].copy()
+    volume_changes = frame["_Volume variation"].copy()
+    display_frame = frame.drop(columns=["_OI variation", "_Volume variation"])
+
+    def movement_column_style(column: pd.Series) -> list[str]:
+        changes = oi_changes if column.name == "Open interest" else volume_changes
+        return [trend_style(changes.get(index)) for index in column.index]
+
+    styler = display_frame.style.map(state_style, subset=["État"]).map(
+        funding_style, subset=["Funding"]
+    )
+    styler = styler.apply(
+        movement_column_style,
+        subset=["Open interest", "Volume 24 h"],
+        axis=0,
+    )
     for column in ("PERP long", "PERP short", "Margin long", "Margin short"):
         styler = styler.map(coverage_style, subset=[column])
     return styler
@@ -455,6 +552,7 @@ def inspect_contract(market: dict[str, Any], coverage: dict[str, dict[str, list[
             str(market.get("margin_short_source", "")),
         ]
     )
+    funding_color = "#67e2b0" if market["funding_pct"] >= 0 else "#ff867d"
     st.markdown(
         f"""
         <div class="bc-detail">
@@ -463,14 +561,14 @@ def inspect_contract(market: dict[str, Any], coverage: dict[str, dict[str, list[
           <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.8rem;font-size:.76rem;color:#929b96">
             <div>Plateforme<br><strong>{VENUE_LABELS[market['exchange']]}</strong></div>
             <div>Tranche funding<br><strong>{market['interval_hours']} h</strong></div>
-            <div>Funding courant<br><strong>{market['funding_pct']:+.6f}%</strong></div>
+            <div>Funding courant<br><strong style="color:{funding_color}">{market['funding_pct']:+.6f}%</strong></div>
             <div>Funding prédit<br><strong>{prediction}</strong></div>
             <div>Hypothèse x10<br><strong>{abs(market['funding_pct']) * 10:.2f}%</strong></div>
-            <div>Échéance UTC<br><strong>{datetime.fromtimestamp(market['next_funding_at'] / 1000, tz=timezone.utc).strftime('%d/%m/%Y %H:%M:%S')}</strong></div>
+            <div>Open interest<br><strong>{movement_html(market.get('open_interest_usd'), market.get('open_interest_change_pct'))}</strong></div>
             <div>Compte à rebours<br><strong>{countdown(market['next_funding_at'], current_ms)}</strong></div>
             <div>Donnée marché<br><strong>{market_age}</strong></div>
             <div>Source tranche<br><strong>{html.escape(str(market.get('interval_source', 'Source indisponible')))}</strong></div>
-            <div>Source échéance<br><strong>{html.escape(deadline_source_label(market))}</strong></div>
+            <div>Volume 24 h<br><strong>{movement_html(market.get('volume_24h_usd'), market.get('volume_24h_change_pct'))}</strong></div>
           </div>
           <div class="bc-coverage-grid">
             {coverage_card('PERP long', asset_coverage['perp_long'])}
@@ -488,7 +586,7 @@ def inspect_contract(market: dict[str, Any], coverage: dict[str, dict[str, list[
 @st.fragment(run_every="3s")
 def live_dashboard() -> None:
     feed = load_feed()
-    markets = feed["markets"]
+    markets = attach_market_dynamics(feed["markets"])
     current_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
     coverage = coverage_by_asset(markets)
     logo_index = load_logo_index()
@@ -532,7 +630,11 @@ def live_dashboard() -> None:
 
     second_row = st.columns([1.25, 1, 1, 1.4])
     with second_row[0]:
-        sort_key = st.selectbox("Trier prioritairement", ["État", "Funding absolu", "Funding signé", "Hypothèse x10", "Échéance"], key="sort_key")
+        sort_key = st.selectbox(
+            "Trier prioritairement",
+            ["État", "Funding absolu", "Funding signé", "Hypothèse x10", "Open interest", "Volume 24 h"],
+            key="sort_key",
+        )
     with second_row[1]:
         sort_direction = st.selectbox("Ordre", ["Décroissant", "Croissant"], key="sort_direction")
     with second_row[2]:
@@ -578,8 +680,10 @@ def live_dashboard() -> None:
         filtered.sort(key=lambda item: abs(item["funding_pct"]), reverse=descending)
     elif sort_key == "Funding signé":
         filtered.sort(key=lambda item: item["funding_pct"], reverse=descending)
+    elif sort_key == "Open interest":
+        filtered.sort(key=lambda item: float(item.get("open_interest_usd") or 0), reverse=descending)
     else:
-        filtered.sort(key=lambda item: item["next_funding_at"], reverse=descending)
+        filtered.sort(key=lambda item: float(item.get("volume_24h_usd") or 0), reverse=descending)
 
     st.markdown(f'<div class="bc-section-label">Marchés affichés · {len(filtered)}</div>', unsafe_allow_html=True)
     frame = table_rows(filtered, coverage, current_ms, logo_index)
@@ -597,10 +701,10 @@ def live_dashboard() -> None:
                 "Actif": st.column_config.TextColumn("Actif", width="small"),
                 "Funding": st.column_config.NumberColumn("Funding courant", format="%+.6f%%"),
                 "Tranche": st.column_config.NumberColumn("Tranche funding", format="%d h"),
-                "Échéance": st.column_config.DatetimeColumn("Échéance UTC", format="DD/MM/YYYY HH:mm:ss"),
+                "Open interest": st.column_config.NumberColumn("Open interest · USD", format="compact"),
+                "Volume 24 h": st.column_config.NumberColumn("Volume 24 h · USD", format="compact"),
                 "Compte à rebours": st.column_config.TextColumn("Compte à rebours", width="medium"),
                 "Source échéance": st.column_config.TextColumn("Source échéance", width="large"),
-                "Signal": st.column_config.TextColumn("Sens funding", width="medium"),
                 "PERP long": st.column_config.TextColumn("PERP long · plateformes", width="large"),
                 "PERP short": st.column_config.TextColumn("PERP short · plateformes", width="large"),
                 "Margin long": st.column_config.TextColumn("Margin long · plateformes", width="large"),
@@ -609,6 +713,10 @@ def live_dashboard() -> None:
                 "Hypothèse x10": st.column_config.NumberColumn("Hypothèse x10", format="%.2f%%"),
                 "Spread PERP": st.column_config.NumberColumn("Spread PERP", format="%.2f bps"),
             },
+        )
+        st.caption(
+            "Couleurs : vert = hausse depuis le scan précédent, rouge = baisse, gris = stable ou première lecture. "
+            "Les montants Open interest et Volume 24 h sont normalisés en USD à partir des champs officiels de chaque plateforme."
         )
 
         contract_ids = [market["id"] for market in filtered]
