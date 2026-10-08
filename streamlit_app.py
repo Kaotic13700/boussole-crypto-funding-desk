@@ -378,6 +378,23 @@ def compact_platforms(platforms: list[str]) -> str:
     return " ".join(VENUE_COMPACT_LABELS.get(platform, platform) for platform in platforms)
 
 
+def contract_qualifier(market: dict[str, Any]) -> str:
+    symbol = str(market.get("symbol", ""))
+    if market.get("exchange") == "Kraken":
+        return "INV" if symbol.startswith("PI_") else "LIN"
+    if "-" in symbol:
+        return symbol.rsplit("-", 1)[-1]
+    for quote in ("USDT", "USDC", "USD"):
+        if symbol.endswith(quote):
+            return quote
+    return "PERP"
+
+
+def compact_market_label(market: dict[str, Any]) -> str:
+    venue = VENUE_COMPACT_LABELS[VENUE_LABELS[market["exchange"]]]
+    return f"{market['asset']} · {venue} · {contract_qualifier(market)}"
+
+
 def compact_directional_coverage(long_platforms: list[str], short_platforms: list[str]) -> str:
     if not long_platforms and not short_platforms:
         return "—"
@@ -475,7 +492,7 @@ def table_rows(
             {
                 "Logo": asset_logo(market["asset"], logo_index),
                 "État": market_state(market["funding_pct"], market["data_status"]),
-                "Marché": f"{market['asset']} · {VENUE_LABELS[market['exchange']]}",
+                "Marché": compact_market_label(market),
                 "Funding": market["funding_pct"],
                 "Tranche": market["interval_hours"],
                 "Open interest": market.get("open_interest_usd"),
@@ -578,7 +595,7 @@ def inspect_contract(market: dict[str, Any], coverage: dict[str, dict[str, list[
         f"""
         <div class="bc-detail">
           <div class="bc-eyebrow">Contrat sélectionné · {market_state(market['funding_pct'], market['data_status'])}</div>
-          <h3 style="margin:.6rem 0 .8rem">{market['asset']} <span style="color:#777;font-size:.72em">PERP</span></h3>
+          <h3 style="margin:.6rem 0 .8rem">{market['asset']} <span style="color:#777;font-size:.72em">{html.escape(str(market['symbol']))} · {contract_qualifier(market)}</span></h3>
           <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.8rem;font-size:.76rem;color:#929b96">
             <div>Plateforme<br><strong>{VENUE_LABELS[market['exchange']]}</strong></div>
             <div>Tranche funding<br><strong>{market['interval_hours']} h</strong></div>
@@ -733,7 +750,7 @@ def live_dashboard() -> None:
         st.caption(
             "Couleurs : vert = hausse depuis le scan précédent, rouge = baisse, gris = stable ou première lecture. "
             "Les montants Open interest et Volume 24 h sont normalisés en USD à partir des champs officiels. "
-            "Couverture : BG = Bitget · KR = Kraken EU* · BF = BloFin · L/S = long/short."
+            "Couverture : BG = Bitget · KR = Kraken EU* · BF = BloFin · L/S = long/short · INV/LIN = contrat inverse/linéaire."
         )
 
         contract_ids = [market["id"] for market in filtered]
@@ -742,7 +759,7 @@ def live_dashboard() -> None:
             "Inspecter un contrat",
             contract_ids,
             format_func=lambda identifier: (
-                f"{by_id[identifier]['asset']} · {VENUE_LABELS[by_id[identifier]['exchange']]} · "
+                f"{by_id[identifier]['symbol']} · {VENUE_LABELS[by_id[identifier]['exchange']]} · "
                 f"{by_id[identifier]['interval_hours']} h · {by_id[identifier]['funding_pct']:+.6f}%"
             ),
             key="selected_contract",

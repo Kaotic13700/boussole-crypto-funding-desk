@@ -404,8 +404,8 @@ def fetch_kraken() -> SourceResult:
                 "volume_24h_usd": volume_24h_usd,
                 "data_status": "live",
                 "updated_at": received_at,
-                "market_data_at": None,
-                "market_timestamp_source": "unavailable",
+                "market_data_at": server_time,
+                "market_timestamp_source": "exchange-server-time",
                 "regional_eligibility": "unverified",
                 "perp_long_available": True,
                 "perp_short_available": True,
@@ -431,7 +431,7 @@ def fetch_kraken() -> SourceResult:
         "Kraken",
         markets,
         received_at,
-        None,
+        server_time,
         "Catalogue public Kraken Futures ; éligibilité EU à confirmer par compte.",
     )
 
