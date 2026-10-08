@@ -410,50 +410,6 @@ def compact_directional_coverage(long_platforms: list[str], short_platforms: lis
     return "✓ " + " | ".join(parts)
 
 
-def relative_change_pct(current: Any, previous: Any) -> float | None:
-    try:
-        current_value = float(current)
-        previous_value = float(previous)
-    except (TypeError, ValueError):
-        return None
-    if previous_value <= 0:
-        return None
-    return (current_value - previous_value) / previous_value * 100
-
-
-def attach_market_dynamics(markets: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    previous = st.session_state.get("market_metric_snapshot", {})
-    current_snapshot: dict[str, dict[str, float | None]] = {}
-    enriched: list[dict[str, Any]] = []
-    for market in markets:
-        open_interest = market.get("open_interest_usd")
-        volume = market.get("volume_24h_usd")
-        open_interest_reference = market.get("open_interest_native")
-        volume_reference = market.get("volume_24h_native")
-        prior = previous.get(market["id"], {})
-        item = {
-            **market,
-            "open_interest_change_pct": (
-                relative_change_pct(open_interest_reference, prior.get("open_interest_native"))
-                if market.get("data_status") == "live"
-                else None
-            ),
-            "volume_24h_change_pct": (
-                relative_change_pct(volume_reference, prior.get("volume_24h_native"))
-                if market.get("data_status") == "live"
-                else None
-            ),
-        }
-        enriched.append(item)
-        if market.get("data_status") == "live":
-            current_snapshot[market["id"]] = {
-                "open_interest_native": open_interest_reference,
-                "volume_24h_native": volume_reference,
-            }
-    st.session_state.market_metric_snapshot = current_snapshot
-    return enriched
-
-
 def compact_usd(value: Any) -> str:
     try:
         number = float(value)
