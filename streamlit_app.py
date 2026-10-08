@@ -71,6 +71,14 @@ st.markdown(
         linear-gradient(145deg, #070909 0%, #0b0e0d 48%, #080a09 100%);
       color: #f4f4ef;
     }}
+    /* Streamlit marque les anciens éléments comme "stale" pendant un fragment rerun.
+       On conserve leur rendu jusqu'au remplacement atomique par les nouvelles données. */
+    div[data-testid="stElementContainer"][data-stale="true"] {{
+      opacity: 1 !important;
+      transition: none !important;
+    }}
+
+
     .stApp::before {{
       content: "";
       position: fixed;
