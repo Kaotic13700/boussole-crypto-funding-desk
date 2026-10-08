@@ -1,6 +1,12 @@
 import pytest
 
-from funding_engine import kraken_relative_funding_pct, market_state, normalize_asset, within_caps
+from funding_engine import (
+    kraken_published_relative_pct,
+    kraken_relative_funding_pct,
+    market_state,
+    normalize_asset,
+    within_caps,
+)
 
 
 def test_kraken_linear_contract_formula() -> None:
@@ -9,6 +15,12 @@ def test_kraken_linear_contract_formula() -> None:
 
 def test_kraken_inverse_contract_formula() -> None:
     assert kraken_relative_funding_pct("PI_XRPUSD", -0.00331, 1.51) == pytest.approx(-0.49981)
+
+
+def test_kraken_published_relative_rate_is_used_directly() -> None:
+    ticker = {"relativeFundingRate": 0.00123, "fundingRate": 999}
+    assert kraken_published_relative_pct(ticker, "relativeFundingRate") == pytest.approx(0.123)
+    assert kraken_published_relative_pct(ticker, "relativeFundingRatePrediction") is None
 
 
 def test_thresholds_do_not_depend_on_leverage() -> None:

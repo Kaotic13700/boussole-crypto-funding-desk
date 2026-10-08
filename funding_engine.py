@@ -108,6 +108,14 @@ def kraken_relative_funding_pct(symbol: str, absolute_rate: float, index_price: 
     return absolute_rate / index_price * 100
 
 
+def kraken_published_relative_pct(ticker: dict[str, Any], field: str) -> float | None:
+    """Read Kraken's published relative rate without reconstructing it."""
+    rate = finite(ticker.get(field))
+    if rate is None:
+        return None
+    return rate * 100
+
+
 def _client() -> httpx.Client:
     return httpx.Client(
         timeout=HTTP_TIMEOUT_SECONDS,
@@ -229,6 +237,7 @@ def fetch_bitget() -> SourceResult:
                 "prediction_source": "not-published-by-exchange",
                 "funding_basis": "current",
                 "interval_hours": int(interval),
+                "interval_source": "API Bitget · fundingRateInterval",
                 "next_funding_at": deadline,
                 "deadline_source": "exchange",
                 "perp_price": last,
@@ -321,17 +330,10 @@ def fetch_kraken() -> SourceResult:
         if ticker.get("tag") != "perpetual" or ticker.get("suspended") is True:
             continue
         symbol = str(ticker.get("symbol", ""))
-        index = finite(ticker.get("indexPrice"))
-        current_absolute = finite(ticker.get("fundingRate"))
-        if not symbol or index is None or index <= 0 or current_absolute is None:
+        current_pct = kraken_published_relative_pct(ticker, "relativeFundingRate")
+        if not symbol or current_pct is None:
             continue
-        current_pct = kraken_relative_funding_pct(symbol, current_absolute, index)
-        predicted_absolute = finite(ticker.get("fundingRatePrediction"))
-        predicted_pct = (
-            None
-            if predicted_absolute is None
-            else kraken_relative_funding_pct(symbol, predicted_absolute, index)
-        )
+        predicted_pct = kraken_published_relative_pct(ticker, "relativeFundingRatePrediction")
         pair_name = str(ticker.get("pair") or symbol).split(":")[0]
         asset = normalize_asset(pair_name.removeprefix("PF_").removeprefix("PI_").removesuffix("USD"))
         margin = margin_by_asset.get(
@@ -353,11 +355,12 @@ def fetch_kraken() -> SourceResult:
                 "direction": "positive" if current_pct >= 0 else "negative",
                 "funding_pct": current_pct,
                 "predicted_funding_pct": predicted_pct,
-                "prediction_source": "kraken-fundingRatePrediction" if predicted_pct is not None else "not-published-by-exchange",
-                "funding_basis": "current",
+                "prediction_source": "kraken-relativeFundingRatePrediction" if predicted_pct is not None else "not-published-by-exchange",
+                "funding_basis": "published-relative-rate",
                 "interval_hours": 1,
+                "interval_source": "Spécification Kraken Perpetual · auto-roll 1 h",
                 "next_funding_at": next_hour,
-                "deadline_source": "schedule-derived",
+                "deadline_source": "kraken-server-clock+official-hourly-boundary",
                 "perp_price": last,
                 "spread_bps": abs(ask - bid) / mid * 10_000 if ask and bid else 0.0,
                 "margin_long_available": bool(margin["long"]),
@@ -466,6 +469,7 @@ def fetch_blofin() -> SourceResult:
                 "prediction_source": "not-published-by-exchange",
                 "funding_basis": "current",
                 "interval_hours": int(interval),
+                "interval_source": "API BloFin · fundingInterval + fundingIntervalUnit",
                 "next_funding_at": deadline,
                 "deadline_source": "exchange",
                 "perp_price": last,

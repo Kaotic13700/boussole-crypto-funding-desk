@@ -335,6 +335,14 @@ def notify_threshold_crossings(markets: list[dict[str, Any]], enabled: bool) -> 
 def availability_text(platforms: list[str]) -> str:
     return "✓ " + " · ".join(platforms) if platforms else "— Indisponible"
 
+def deadline_source_label(market: dict[str, Any]) -> str:
+    if market.get("deadline_source") == "exchange":
+        return f"API {VENUE_LABELS[market['exchange']]} · timestamp publié"
+    if market.get("deadline_source") == "kraken-server-clock+official-hourly-boundary":
+        return "Kraken · horloge serveur + borne horaire officielle"
+    return "Source indisponible"
+
+
 
 def table_rows(
     markets: list[dict[str, Any]],
@@ -351,6 +359,10 @@ def table_rows(
                 "État": market_state(market["funding_pct"], market["data_status"]),
                 "Actif": market["asset"],
                 "Funding": market["funding_pct"],
+                "Tranche": market["interval_hours"],
+                "Échéance": datetime.fromtimestamp(market["next_funding_at"] / 1000, tz=timezone.utc),
+                "Compte à rebours": countdown(market["next_funding_at"], current_ms),
+                "Source échéance": deadline_source_label(market),
                 "Signal": "SHORT PERP reçoit" if market["funding_pct"] > 0 else "LONG PERP reçoit",
                 "PERP long": availability_text(asset_coverage["perp_long"]),
                 "PERP short": availability_text(asset_coverage["perp_short"]),
@@ -358,11 +370,8 @@ def table_rows(
                 "Margin short": availability_text(asset_coverage["margin_short"]),
                 "Plateforme": VENUE_LABELS[market["exchange"]],
                 "Symbole": market["symbol"],
-                "Fenêtre": market["interval_hours"],
                 "Prévision": market["predicted_funding_pct"],
                 "Hypothèse x10": abs(market["funding_pct"]) * 10,
-                "Échéance": datetime.fromtimestamp(market["next_funding_at"] / 1000, tz=timezone.utc),
-                "Compte à rebours": countdown(market["next_funding_at"], current_ms),
                 "Spread PERP": market["spread_bps"],
                 "Statut donnée": "LIVE" if market["data_status"] == "live" else "PÉRIMÉE",
             }
@@ -432,13 +441,15 @@ def inspect_contract(market: dict[str, Any], coverage: dict[str, dict[str, list[
           <h3 style="margin:.6rem 0 .8rem">{market['asset']} <span style="color:#777;font-size:.72em">PERP</span></h3>
           <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.8rem;font-size:.76rem;color:#929b96">
             <div>Plateforme<br><strong>{VENUE_LABELS[market['exchange']]}</strong></div>
-            <div>Fenêtre<br><strong>{market['interval_hours']} h</strong></div>
+            <div>Tranche funding<br><strong>{market['interval_hours']} h</strong></div>
             <div>Funding courant<br><strong>{market['funding_pct']:+.6f}%</strong></div>
             <div>Funding prédit<br><strong>{prediction}</strong></div>
             <div>Hypothèse x10<br><strong>{abs(market['funding_pct']) * 10:.2f}%</strong></div>
-            <div>Échéance<br><strong>{countdown(market['next_funding_at'], current_ms)}</strong></div>
+            <div>Échéance UTC<br><strong>{datetime.fromtimestamp(market['next_funding_at'] / 1000, tz=timezone.utc).strftime('%d/%m/%Y %H:%M:%S')}</strong></div>
+            <div>Compte à rebours<br><strong>{countdown(market['next_funding_at'], current_ms)}</strong></div>
             <div>Donnée marché<br><strong>{market_age}</strong></div>
-            <div>Source échéance<br><strong>{'API exchange' if market['deadline_source'] == 'exchange' else 'Cadence officielle'}</strong></div>
+            <div>Source tranche<br><strong>{html.escape(str(market.get('interval_source', 'Source indisponible')))}</strong></div>
+            <div>Source échéance<br><strong>{html.escape(deadline_source_label(market))}</strong></div>
           </div>
           <div class="bc-coverage-grid">
             {coverage_card('PERP long', asset_coverage['perp_long'])}
@@ -563,16 +574,18 @@ def live_dashboard() -> None:
                 "Logo": st.column_config.ImageColumn("", width="small"),
                 "État": st.column_config.TextColumn("État", width="small"),
                 "Actif": st.column_config.TextColumn("Actif", width="small"),
+                "Funding": st.column_config.NumberColumn("Funding courant", format="%+.6f%%"),
+                "Tranche": st.column_config.NumberColumn("Tranche funding", format="%d h"),
+                "Échéance": st.column_config.DatetimeColumn("Échéance UTC", format="DD/MM/YYYY HH:mm:ss"),
+                "Compte à rebours": st.column_config.TextColumn("Compte à rebours", width="medium"),
+                "Source échéance": st.column_config.TextColumn("Source échéance", width="large"),
                 "Signal": st.column_config.TextColumn("Sens funding", width="medium"),
                 "PERP long": st.column_config.TextColumn("PERP long · plateformes", width="large"),
                 "PERP short": st.column_config.TextColumn("PERP short · plateformes", width="large"),
                 "Margin long": st.column_config.TextColumn("Margin long · plateformes", width="large"),
                 "Margin short": st.column_config.TextColumn("Margin short · plateformes", width="large"),
-                "Fenêtre": st.column_config.NumberColumn("Fenêtre", format="%d h"),
-                "Funding": st.column_config.NumberColumn("Funding courant", format="%+.6f%%"),
                 "Prévision": st.column_config.NumberColumn("Prévision", format="%+.6f%%"),
                 "Hypothèse x10": st.column_config.NumberColumn("Hypothèse x10", format="%.2f%%"),
-                "Échéance": st.column_config.DatetimeColumn("Échéance UTC", format="HH:mm:ss"),
                 "Spread PERP": st.column_config.NumberColumn("Spread PERP", format="%.2f bps"),
             },
         )
@@ -592,7 +605,8 @@ def live_dashboard() -> None:
 
     st.markdown(
         '<div class="bc-footer"><strong>Lecture des signaux :</strong> funding positif → le short PERP reçoit normalement le funding ; funding négatif → le long PERP le reçoit. '
-        'L’hypothèse x10 est brute et informative, jamais une condition d’entrée. Les disponibilités PERP et margin sont issues des catalogues officiels ; elles ne signifient pas qu’une quantité d’emprunt précise est garantie au moment d’un ordre. '
+        'L’hypothèse x10 est brute et informative, jamais une condition d’entrée. Sur Kraken, le funding est continu : la borne affichée est la prochaine réalisation horaire, calculée depuis l’horloge serveur et la cadence officielle. '
+        'Les disponibilités PERP et margin sont issues des catalogues officiels ; elles ne signifient pas qu’une quantité d’emprunt précise est garantie au moment d’un ordre. '
         '* Kraken EU : catalogue public Futures, éligibilité réglementaire à confirmer selon le compte. Streamlit Community Cloud peut mettre une application inactive en veille.</div>',
         unsafe_allow_html=True,
     )
