@@ -466,6 +466,19 @@ def compact_usd(value: Any) -> str:
     return f"{number:,.0f} $".replace(",", " ")
 
 
+def movement_text(value: Any, change_pct: Any) -> str:
+    amount = compact_usd(value)
+    try:
+        change = float(change_pct)
+    except (TypeError, ValueError):
+        return f"{amount} · —"
+    if change > 0:
+        return f"{amount} · ▲ {change:+.3f}%"
+    if change < 0:
+        return f"{amount} · ▼ {change:+.3f}%"
+    return f"{amount} · ● 0.000%"
+
+
 def movement_html(value: Any, change_pct: Any) -> str:
     try:
         change = float(change_pct)
@@ -497,9 +510,15 @@ def table_rows(
                 "Marché": compact_market_label(market),
                 "Funding": market["funding_pct"],
                 "Tranche": market["interval_hours"],
-                "Open interest": market.get("open_interest_usd"),
+                "Open interest": movement_text(
+                    market.get("open_interest_usd"),
+                    market.get("open_interest_change_pct"),
+                ),
                 "_OI variation": market.get("open_interest_change_pct"),
-                "Volume 24 h": market.get("volume_24h_usd"),
+                "Volume 24 h": movement_text(
+                    market.get("volume_24h_usd"),
+                    market.get("volume_24h_change_pct"),
+                ),
                 "_Volume variation": market.get("volume_24h_change_pct"),
                 "Compte à rebours": countdown(market["next_funding_at"], current_ms),
                 "PERP L/S": compact_directional_coverage(asset_coverage["perp_long"], asset_coverage["perp_short"]),
@@ -751,8 +770,8 @@ def live_dashboard() -> None:
                 "Marché": st.column_config.TextColumn("Marché · funding", width=120),
                 "Funding": st.column_config.NumberColumn("Funding", format="%+.6f%%", width=96),
                 "Tranche": st.column_config.NumberColumn("Tranche", format="%d h", width=64),
-                "Open interest": st.column_config.NumberColumn("OI · USD", format="compact", width=92),
-                "Volume 24 h": st.column_config.NumberColumn("Volume 24 h · USD", format="compact", width=96),
+                "Open interest": st.column_config.TextColumn("OI · USD · Δ scan", width=130),
+                "Volume 24 h": st.column_config.TextColumn("Volume 24 h · USD · Δ scan", width=142),
                 "Compte à rebours": st.column_config.TextColumn("Prochain funding", width=96),
                 "PERP L/S": st.column_config.TextColumn("PERP L/S", width=120),
                 "Margin L/S": st.column_config.TextColumn("Margin L/S", width=140),
