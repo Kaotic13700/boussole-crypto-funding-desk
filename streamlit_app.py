@@ -371,6 +371,26 @@ def deadline_source_label(market: dict[str, Any]) -> str:
         return "Kraken · horloge serveur + borne horaire officielle"
     return "Source indisponible"
 
+VENUE_COMPACT_LABELS = {"Bitget": "BG", "Kraken EU*": "KR", "BloFin": "BF"}
+
+
+def compact_platforms(platforms: list[str]) -> str:
+    return " ".join(VENUE_COMPACT_LABELS.get(platform, platform) for platform in platforms)
+
+
+def compact_directional_coverage(long_platforms: list[str], short_platforms: list[str]) -> str:
+    if not long_platforms and not short_platforms:
+        return "—"
+    if long_platforms == short_platforms:
+        return f"✓ L/S · {compact_platforms(long_platforms)}"
+    parts: list[str] = []
+    if long_platforms:
+        parts.append(f"L · {compact_platforms(long_platforms)}")
+    if short_platforms:
+        parts.append(f"S · {compact_platforms(short_platforms)}")
+    return "✓ " + " | ".join(parts)
+
+
 def relative_change_pct(current: Any, previous: Any) -> float | None:
     try:
         current_value = float(current)
@@ -455,7 +475,7 @@ def table_rows(
             {
                 "Logo": asset_logo(market["asset"], logo_index),
                 "État": market_state(market["funding_pct"], market["data_status"]),
-                "Actif": market["asset"],
+                "Marché": f"{market['asset']} · {VENUE_LABELS[market['exchange']]}",
                 "Funding": market["funding_pct"],
                 "Tranche": market["interval_hours"],
                 "Open interest": market.get("open_interest_usd"),
@@ -463,17 +483,10 @@ def table_rows(
                 "Volume 24 h": market.get("volume_24h_usd"),
                 "_Volume variation": market.get("volume_24h_change_pct"),
                 "Compte à rebours": countdown(market["next_funding_at"], current_ms),
-                "Source échéance": deadline_source_label(market),
-                "PERP long": availability_text(asset_coverage["perp_long"]),
-                "PERP short": availability_text(asset_coverage["perp_short"]),
-                "Margin long": availability_text(asset_coverage["margin_long"]),
-                "Margin short": availability_text(asset_coverage["margin_short"]),
-                "Plateforme": VENUE_LABELS[market["exchange"]],
-                "Symbole": market["symbol"],
+                "PERP L/S": compact_directional_coverage(asset_coverage["perp_long"], asset_coverage["perp_short"]),
+                "Margin L/S": compact_directional_coverage(asset_coverage["margin_long"], asset_coverage["margin_short"]),
                 "Prévision": market["predicted_funding_pct"],
-                "Hypothèse x10": abs(market["funding_pct"]) * 10,
                 "Spread PERP": market["spread_bps"],
-                "Statut donnée": "LIVE" if market["data_status"] == "live" else "PÉRIMÉE",
             }
         )
     return pd.DataFrame(rows)
@@ -531,7 +544,7 @@ def styled_market_frame(frame: pd.DataFrame) -> Any:
         subset=["Open interest", "Volume 24 h"],
         axis=0,
     )
-    for column in ("PERP long", "PERP short", "Margin long", "Margin short"):
+    for column in ("PERP L/S", "Margin L/S"):
         styler = styler.map(coverage_style, subset=[column])
     return styler
 
@@ -571,7 +584,6 @@ def inspect_contract(market: dict[str, Any], coverage: dict[str, dict[str, list[
             <div>Tranche funding<br><strong>{market['interval_hours']} h</strong></div>
             <div>Funding courant<br><strong style="color:{funding_color}">{market['funding_pct']:+.6f}%</strong></div>
             <div>Funding prédit<br><strong>{prediction}</strong></div>
-            <div>Hypothèse x10<br><strong>{abs(market['funding_pct']) * 10:.2f}%</strong></div>
             <div>Open interest<br><strong>{movement_html(market.get('open_interest_usd'), market.get('open_interest_change_pct'))}</strong></div>
             <div>Compte à rebours<br><strong>{countdown(market['next_funding_at'], current_ms)}</strong></div>
             <div>Donnée marché<br><strong>{market_age}</strong></div>
@@ -640,7 +652,7 @@ def live_dashboard() -> None:
     with second_row[0]:
         sort_key = st.selectbox(
             "Trier prioritairement",
-            ["État", "Funding absolu", "Funding signé", "Hypothèse x10", "Open interest", "Volume 24 h"],
+            ["État", "Funding absolu", "Funding signé", "Open interest", "Volume 24 h"],
             key="sort_key",
         )
     with second_row[1]:
@@ -684,7 +696,7 @@ def live_dashboard() -> None:
     descending = sort_direction == "Décroissant"
     if sort_key == "État":
         filtered.sort(key=lambda item: (STATE_RANK[market_state(item["funding_pct"], item["data_status"])], abs(item["funding_pct"])), reverse=descending)
-    elif sort_key in {"Funding absolu", "Hypothèse x10"}:
+    elif sort_key == "Funding absolu":
         filtered.sort(key=lambda item: abs(item["funding_pct"]), reverse=descending)
     elif sort_key == "Funding signé":
         filtered.sort(key=lambda item: item["funding_pct"], reverse=descending)
@@ -704,27 +716,24 @@ def live_dashboard() -> None:
             height=680,
             hide_index=True,
             column_config={
-                "Logo": st.column_config.ImageColumn("", width="small"),
-                "État": st.column_config.TextColumn("État", width="small"),
-                "Actif": st.column_config.TextColumn("Actif", width="small"),
-                "Funding": st.column_config.NumberColumn("Funding courant", format="%+.6f%%"),
-                "Tranche": st.column_config.NumberColumn("Tranche funding", format="%d h"),
-                "Open interest": st.column_config.NumberColumn("Open interest · USD", format="compact"),
-                "Volume 24 h": st.column_config.NumberColumn("Volume 24 h · USD", format="compact"),
-                "Compte à rebours": st.column_config.TextColumn("Compte à rebours", width="medium"),
-                "Source échéance": st.column_config.TextColumn("Source échéance", width="large"),
-                "PERP long": st.column_config.TextColumn("PERP long · plateformes", width="large"),
-                "PERP short": st.column_config.TextColumn("PERP short · plateformes", width="large"),
-                "Margin long": st.column_config.TextColumn("Margin long · plateformes", width="large"),
-                "Margin short": st.column_config.TextColumn("Margin short · plateformes", width="large"),
-                "Prévision": st.column_config.NumberColumn("Prévision", format="%+.6f%%"),
-                "Hypothèse x10": st.column_config.NumberColumn("Hypothèse x10", format="%.2f%%"),
-                "Spread PERP": st.column_config.NumberColumn("Spread PERP", format="%.2f bps"),
+                "Logo": st.column_config.ImageColumn("", width=40),
+                "État": st.column_config.TextColumn("État", width=68),
+                "Marché": st.column_config.TextColumn("Marché · funding", width=120),
+                "Funding": st.column_config.NumberColumn("Funding", format="%+.6f%%", width=96),
+                "Tranche": st.column_config.NumberColumn("Tranche", format="%d h", width=64),
+                "Open interest": st.column_config.NumberColumn("OI · USD", format="compact", width=92),
+                "Volume 24 h": st.column_config.NumberColumn("Volume 24 h · USD", format="compact", width=96),
+                "Compte à rebours": st.column_config.TextColumn("Prochain funding", width=96),
+                "PERP L/S": st.column_config.TextColumn("PERP L/S", width=120),
+                "Margin L/S": st.column_config.TextColumn("Margin L/S", width=140),
+                "Prévision": st.column_config.NumberColumn("Prévision", format="%+.6f%%", width=88),
+                "Spread PERP": st.column_config.NumberColumn("Spread", format="%.2f bps", width=70),
             },
         )
         st.caption(
             "Couleurs : vert = hausse depuis le scan précédent, rouge = baisse, gris = stable ou première lecture. "
-            "Les montants Open interest et Volume 24 h sont normalisés en USD à partir des champs officiels de chaque plateforme."
+            "Les montants Open interest et Volume 24 h sont normalisés en USD à partir des champs officiels. "
+            "Couverture : BG = Bitget · KR = Kraken EU* · BF = BloFin · L/S = long/short."
         )
 
         contract_ids = [market["id"] for market in filtered]
