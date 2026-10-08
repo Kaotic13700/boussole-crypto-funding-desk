@@ -1,6 +1,9 @@
 import pytest
 
 from funding_engine import (
+    SourceResult,
+    fresh_market_timestamp,
+    funding_rates_match,
     kraken_open_interest_usd,
     kraken_published_relative_pct,
     kraken_relative_funding_pct,
@@ -46,3 +49,25 @@ def test_asset_normalization() -> None:
 def test_exchange_caps() -> None:
     assert within_caps(0.003, "-0.003", "0.003")
     assert not within_caps(0.004, "-0.003", "0.003")
+
+
+def test_cross_endpoint_funding_match_is_strict() -> None:
+    assert funding_rates_match("0.005", 0.005)
+    assert funding_rates_match("-0.01", "-0.01000000001")
+    assert not funding_rates_match("0.005", "0.0049")
+    assert not funding_rates_match(None, "0.005")
+
+
+def test_market_timestamp_must_be_recent_and_not_in_the_future() -> None:
+    reference = 1_000_000
+    assert fresh_market_timestamp(reference - 179_999, reference)
+    assert not fresh_market_timestamp(reference - 180_001, reference)
+    assert not fresh_market_timestamp(reference + 30_001, reference)
+    assert not fresh_market_timestamp(None, reference)
+
+
+def test_source_result_tracks_rejections_without_mutable_default_leak() -> None:
+    first = SourceResult("A", [], 1, 1)
+    second = SourceResult("B", [], 1, 1)
+    first.rejections.append({"symbol": "TEST"})
+    assert second.rejections == []

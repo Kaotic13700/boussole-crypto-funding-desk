@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import math
 import threading
@@ -21,6 +21,10 @@ import httpx
 ALLOWED_INTERVALS = {1.0, 4.0, 8.0}
 STALE_CACHE_SECONDS = 10 * 60
 HTTP_TIMEOUT_SECONDS = 8.0
+MAX_MARKET_DATA_AGE_MS = 3 * 60 * 1000
+MAX_FUTURE_CLOCK_SKEW_MS = 30 * 1000
+ENHANCED_VERIFICATION_THRESHOLD_PCT = 0.4
+KRAKEN_INVERSE_HOURLY_CAP_PCT = 0.25
 
 
 @dataclass
@@ -30,6 +34,7 @@ class SourceResult:
     received_at: int
     market_data_at: int | None
     message: str | None = None
+    rejections: list[dict[str, Any]] = field(default_factory=list)
 
 
 _last_good: dict[str, tuple[SourceResult, int]] = {}
@@ -73,6 +78,52 @@ def within_caps(rate: float, floor_value: Any, cap_value: Any) -> bool:
     if cap is not None and rate > cap + 1e-12:
         return False
     return True
+
+
+def funding_rates_match(
+    first: Any,
+    second: Any,
+    absolute_tolerance: float = 1e-10,
+    relative_tolerance: float = 1e-7,
+) -> bool:
+    """Require two official fields to describe the same current funding rate."""
+    left = finite(first)
+    right = finite(second)
+    return (
+        left is not None
+        and right is not None
+        and math.isclose(
+            left,
+            right,
+            rel_tol=relative_tolerance,
+            abs_tol=absolute_tolerance,
+        )
+    )
+
+
+def fresh_market_timestamp(
+    timestamp: Any,
+    reference_ms: int,
+    max_age_ms: int = MAX_MARKET_DATA_AGE_MS,
+) -> bool:
+    value = timestamp_ms(timestamp)
+    if value is None:
+        return False
+    return reference_ms - max_age_ms <= value <= reference_ms + MAX_FUTURE_CLOCK_SKEW_MS
+
+
+def rejection(
+    exchange: str,
+    symbol: str,
+    reason: str,
+    funding_pct: float | None = None,
+) -> dict[str, Any]:
+    return {
+        "exchange": exchange,
+        "symbol": symbol,
+        "reason": reason,
+        "funding_pct": funding_pct,
+    }
 
 
 def normalize_asset(value: str) -> str:
@@ -181,13 +232,14 @@ def fetch_bitget() -> SourceResult:
 
     margin_by_symbol = {row.get("symbol"): row for row in margin_rows}
     ticker_by_symbol = {row.get("symbol"): row for row in ticker_rows}
-    live_perps = {
-        row.get("symbol")
+    instrument_by_symbol = {
+        row.get("symbol"): row
         for row in instrument_rows
         if row.get("status") == "online" and row.get("type") in (None, "", "perpetual")
     }
     received_at = now_ms()
     markets: list[dict[str, Any]] = []
+    rejections: list[dict[str, Any]] = []
 
     for row in funding_rows:
         symbol = str(row.get("symbol", ""))
@@ -195,6 +247,7 @@ def fetch_bitget() -> SourceResult:
         interval = finite(row.get("fundingRateInterval"))
         deadline = timestamp_ms(row.get("nextUpdate"))
         ticker = ticker_by_symbol.get(symbol)
+        instrument = instrument_by_symbol.get(symbol)
         if (
             not symbol
             or rate is None
@@ -202,14 +255,26 @@ def fetch_bitget() -> SourceResult:
             or deadline is None
             or deadline <= received_at
             or ticker is None
-            or symbol not in live_perps
+            or instrument is None
         ):
             continue
+        funding_pct = rate * 100
         if not within_caps(
             rate,
             row.get("minFundingRate", row.get("fundingRateFloor")),
             row.get("maxFundingRate", row.get("fundingRateCap")),
         ):
+            rejections.append(rejection("Bitget", symbol, "taux hors bornes officielles", funding_pct))
+            continue
+        if not funding_rates_match(rate, ticker.get("fundingRate")):
+            rejections.append(
+                rejection("Bitget", symbol, "désaccord funding ↔ ticker officiel", funding_pct)
+            )
+            continue
+        if not funding_rates_match(interval, instrument.get("fundInterval"), absolute_tolerance=1e-8):
+            rejections.append(
+                rejection("Bitget", symbol, "désaccord de tranche funding ↔ contrat", funding_pct)
+            )
             continue
 
         last = finite(ticker.get("lastPrice")) or 0.0
@@ -219,6 +284,11 @@ def fetch_bitget() -> SourceResult:
             continue
         mid = (ask + bid) / 2
         market_ts = timestamp_ms(ticker.get("ts"))
+        if not fresh_market_timestamp(market_ts, received_at):
+            rejections.append(
+                rejection("Bitget", symbol, "ticker officiel absent ou périmé", funding_pct)
+            )
+            continue
         margin = margin_by_symbol.get(symbol) or {}
         margin_online = margin.get("status") == "online"
         margin_long = margin_online and margin.get("isIsolatedQuotedBorrowable") == "YES"
@@ -235,7 +305,6 @@ def fetch_bitget() -> SourceResult:
             ),
             None,
         )
-        funding_pct = rate * 100
         mark_price = finite(ticker.get("markPrice")) or last
         volume_24h_usd = finite(ticker.get("turnover24h"))
         open_interest = finite(ticker.get("openInterest"))
@@ -251,6 +320,9 @@ def fetch_bitget() -> SourceResult:
                 "predicted_funding_pct": None,
                 "prediction_source": "not-published-by-exchange",
                 "funding_basis": "current",
+                "funding_verified": True,
+                "funding_verification_source": "Bitget current-fund-rate + ticker + contrat",
+                "verification_level": "cross-endpoint",
                 "interval_hours": int(interval),
                 "interval_source": "API Bitget · fundingRateInterval",
                 "next_funding_at": deadline,
@@ -295,7 +367,13 @@ def fetch_bitget() -> SourceResult:
         raise ValueError("Bitget: aucun PERP valide après contrôle")
     markets.sort(key=lambda item: abs(item["funding_pct"]), reverse=True)
     market_times = [item["market_data_at"] for item in markets if item["market_data_at"]]
-    return SourceResult("Bitget", markets, received_at, min(market_times) if market_times else None)
+    return SourceResult(
+        "Bitget",
+        markets,
+        received_at,
+        min(market_times) if market_times else None,
+        rejections=rejections,
+    )
 
 
 def fetch_kraken() -> SourceResult:
@@ -347,7 +425,10 @@ def fetch_kraken() -> SourceResult:
         raise ValueError("Kraken Futures: horloge serveur invalide") from error
     next_hour = (server_time // 3_600_000 + 1) * 3_600_000
     received_at = now_ms()
+    if not fresh_market_timestamp(server_time, received_at, max_age_ms=30_000):
+        raise ValueError("Kraken Futures: horloge serveur périmée ou incohérente")
     markets: list[dict[str, Any]] = []
+    rejections: list[dict[str, Any]] = []
 
     for ticker in tickers:
         if ticker.get("tag") != "perpetual" or ticker.get("suspended") is True:
@@ -356,7 +437,43 @@ def fetch_kraken() -> SourceResult:
         current_pct = kraken_published_relative_pct(ticker, "relativeFundingRate")
         if not symbol or current_pct is None:
             continue
+        index_price = finite(ticker.get("indexPrice"))
+        absolute_rate = finite(ticker.get("fundingRate"))
+        if index_price is None or absolute_rate is None:
+            rejections.append(
+                rejection("Kraken", symbol, "preuve taux absolu/indice absente", current_pct)
+            )
+            continue
+        reconstructed_pct = kraken_relative_funding_pct(symbol, absolute_rate, index_price)
+        if not funding_rates_match(
+            current_pct,
+            reconstructed_pct,
+            absolute_tolerance=0.002,
+            relative_tolerance=0.02,
+        ):
+            rejections.append(
+                rejection("Kraken", symbol, "désaccord taux relatif ↔ taux absolu/indice", current_pct)
+            )
+            continue
+        if symbol.startswith("PI_") and abs(current_pct) > KRAKEN_INVERSE_HOURLY_CAP_PCT + 1e-9:
+            rejections.append(
+                rejection("Kraken", symbol, "taux inverse hors borne documentaire ±0,25 %/h", current_pct)
+            )
+            continue
+
         predicted_pct = kraken_published_relative_pct(ticker, "relativeFundingRatePrediction")
+        predicted_absolute = finite(ticker.get("fundingRatePrediction"))
+        if predicted_pct is not None and predicted_absolute is not None:
+            reconstructed_prediction = kraken_relative_funding_pct(
+                symbol, predicted_absolute, index_price
+            )
+            if not funding_rates_match(
+                predicted_pct,
+                reconstructed_prediction,
+                absolute_tolerance=0.002,
+                relative_tolerance=0.02,
+            ):
+                predicted_pct = None
         pair_name = str(ticker.get("pair") or symbol).split(":")[0]
         asset = normalize_asset(pair_name.removeprefix("PF_").removeprefix("PI_").removesuffix("USD"))
         margin = margin_by_asset.get(
@@ -384,6 +501,9 @@ def fetch_kraken() -> SourceResult:
                 "predicted_funding_pct": predicted_pct,
                 "prediction_source": "kraken-relativeFundingRatePrediction" if predicted_pct is not None else "not-published-by-exchange",
                 "funding_basis": "published-relative-rate",
+                "funding_verified": True,
+                "funding_verification_source": "Kraken relatif + absolu/index + spécification contrat",
+                "verification_level": "cross-field+documented-cap",
                 "interval_hours": 1,
                 "interval_source": "Spécification Kraken Perpetual · auto-roll 1 h",
                 "next_funding_at": next_hour,
@@ -433,6 +553,7 @@ def fetch_kraken() -> SourceResult:
         received_at,
         server_time,
         "Catalogue public Kraken Futures ; éligibilité EU à confirmer par compte.",
+        rejections=rejections,
     )
 
 
@@ -463,8 +584,43 @@ def fetch_blofin() -> SourceResult:
     open_interest_rows = require_list(payloads["open_interest"].get("data"), "BloFin open interest")
     open_interest_by_id = {row.get("instId"): row for row in open_interest_rows}
     ticker_by_id = {row.get("instId"): row for row in tickers}
+
+    enhanced_ids = {
+        str(row.get("instId", ""))
+        for row in funding_rows
+        if (
+            (rate := finite(row.get("fundingRate"))) is not None
+            and abs(rate * 100) >= ENHANCED_VERIFICATION_THRESHOLD_PCT
+        )
+    }
+    enhanced_confirmation: dict[str, float | None] = {}
+    if enhanced_ids:
+        def confirm_rate(instrument_id: str) -> tuple[str, float | None]:
+            try:
+                with _client() as confirmation_client:
+                    payload = _json(
+                        confirmation_client,
+                        f"{base}/api/v1/market/funding-rate?instId={instrument_id}",
+                    )
+                assert_business_success(payload, f"BloFin confirmation {instrument_id}", "0")
+                rows = require_list(payload.get("data"), f"BloFin confirmation {instrument_id}")
+                exact = next(
+                    (item for item in rows if item.get("instId") == instrument_id),
+                    None,
+                )
+                return instrument_id, finite(exact.get("fundingRate")) if exact else None
+            except Exception:
+                return instrument_id, None
+
+        with ThreadPoolExecutor(max_workers=min(4, len(enhanced_ids))) as pool:
+            futures = [pool.submit(confirm_rate, instrument_id) for instrument_id in enhanced_ids]
+            for future in as_completed(futures):
+                instrument_id, confirmed_rate = future.result()
+                enhanced_confirmation[instrument_id] = confirmed_rate
+
     received_at = now_ms()
     markets: list[dict[str, Any]] = []
+    rejections: list[dict[str, Any]] = []
 
     for row in funding_rows:
         instrument_id = str(row.get("instId", ""))
@@ -483,7 +639,16 @@ def fetch_blofin() -> SourceResult:
             or raw_interval is None
         ):
             continue
+        funding_pct = rate * 100
         if not within_caps(rate, row.get("fundingRateFloor"), row.get("fundingRateCap")):
+            rejections.append(rejection("BloFin", instrument_id, "taux hors bornes officielles", funding_pct))
+            continue
+        if instrument_id in enhanced_ids and not funding_rates_match(
+            rate, enhanced_confirmation.get(instrument_id)
+        ):
+            rejections.append(
+                rejection("BloFin", instrument_id, "seconde lecture officielle non concordante", funding_pct)
+            )
             continue
         interval = raw_interval / 60 if row.get("fundingIntervalUnit") == "minute" else raw_interval
         if interval not in ALLOWED_INTERVALS:
@@ -499,7 +664,11 @@ def fetch_blofin() -> SourceResult:
             continue
         mid = (ask + bid) / 2
         market_ts = timestamp_ms(ticker.get("ts"))
-        funding_pct = rate * 100
+        if not fresh_market_timestamp(market_ts, received_at):
+            rejections.append(
+                rejection("BloFin", instrument_id, "ticker officiel absent ou périmé", funding_pct)
+            )
+            continue
         mark_price = finite(ticker.get("markPrice")) or last
         volume_24h_native = finite(ticker.get("volCurrency24h"))
         volume_24h_usd = (volume_24h_native or 0.0) * mark_price
@@ -521,6 +690,17 @@ def fetch_blofin() -> SourceResult:
                 "predicted_funding_pct": None,
                 "prediction_source": "not-published-by-exchange",
                 "funding_basis": "current",
+                "funding_verified": True,
+                "funding_verification_source": (
+                    "BloFin funding-rate relu + contrat/ticker/cap"
+                    if instrument_id in enhanced_ids
+                    else "BloFin funding-rate + contrat/ticker/cap"
+                ),
+                "verification_level": (
+                    "enhanced-double-read"
+                    if instrument_id in enhanced_ids
+                    else "official-endpoint+metadata"
+                ),
                 "interval_hours": int(interval),
                 "interval_source": "API BloFin · fundingInterval + fundingIntervalUnit",
                 "next_funding_at": deadline,
@@ -553,7 +733,13 @@ def fetch_blofin() -> SourceResult:
         raise ValueError("BloFin: aucun PERP valide après contrôle")
     markets.sort(key=lambda item: abs(item["funding_pct"]), reverse=True)
     market_times = [item["market_data_at"] for item in markets if item["market_data_at"]]
-    return SourceResult("BloFin", markets, received_at, min(market_times) if market_times else None)
+    return SourceResult(
+        "BloFin",
+        markets,
+        received_at,
+        min(market_times) if market_times else None,
+        rejections=rejections,
+    )
 
 
 def _source_health(result: SourceResult, fetched_at: int, status: str, message: str | None = None) -> dict[str, Any]:
@@ -561,6 +747,7 @@ def _source_health(result: SourceResult, fetched_at: int, status: str, message: 
         "exchange": result.exchange,
         "status": status,
         "markets": len(result.markets),
+        "rejected": len(result.rejections),
         "source_updated_at": result.received_at,
         "age_ms": max(0, fetched_at - result.received_at),
         "market_data_age_ms": (
@@ -590,6 +777,7 @@ def collect_feed() -> dict[str, Any]:
     fetched_at = now_ms()
     markets: list[dict[str, Any]] = []
     sources: list[dict[str, Any]] = []
+    rejections: list[dict[str, Any]] = []
     live_sources = 0
 
     for exchange in ("Bitget", "Kraken", "BloFin"):
@@ -599,6 +787,7 @@ def collect_feed() -> dict[str, Any]:
             with _last_good_lock:
                 _last_good[exchange] = (deepcopy(result), fetched_at)
             markets.extend(result.markets)
+            rejections.extend(result.rejections)
             sources.append(_source_health(result, fetched_at, "live"))
             continue
 
@@ -615,6 +804,7 @@ def collect_feed() -> dict[str, Any]:
                     if market["next_funding_at"] > fetched_at
                 ]
                 markets.extend(cached.markets)
+                rejections.extend(cached.rejections)
                 health = _source_health(cached, fetched_at, "stale", error_message)
                 health["age_ms"] = cache_age
                 sources.append(health)
@@ -624,6 +814,7 @@ def collect_feed() -> dict[str, Any]:
                 "exchange": exchange,
                 "status": "error",
                 "markets": 0,
+                "rejected": 0,
                 "source_updated_at": None,
                 "age_ms": None,
                 "market_data_age_ms": None,
@@ -634,7 +825,8 @@ def collect_feed() -> dict[str, Any]:
     markets = [
         market
         for market in markets
-        if float(market["interval_hours"]) in ALLOWED_INTERVALS
+        if market.get("funding_verified") is True
+        and float(market["interval_hours"]) in ALLOWED_INTERVALS
         and math.isfinite(float(market["funding_pct"]))
         and market["next_funding_at"] > fetched_at
     ]
@@ -649,6 +841,7 @@ def collect_feed() -> dict[str, Any]:
     return {
         "mode": mode,
         "markets": markets,
+        "rejections": rejections,
         "fetched_at": fetched_at,
         "latency_ms": fetched_at - started_at,
         "sources": sources,

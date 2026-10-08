@@ -328,9 +328,11 @@ def source_badges(sources: list[dict[str, Any]]) -> None:
             if source["market_data_age_ms"] is None
             else f" · marché {age_label(source['market_data_age_ms'])}"
         )
+        rejected = int(source.get("rejected") or 0)
+        rejected_text = f" · {rejected} écarté{'s' if rejected != 1 else ''}" if rejected else ""
         pieces.append(
             f'<span class="bc-source {status}" title="{source.get("message") or ""}"><i class="bc-dot"></i>'
-            f'{VENUE_LABELS[source["exchange"]]} · {status.upper()} · {source["markets"]} PERP · scan {age}{market_age}</span>'
+            f'{VENUE_LABELS[source["exchange"]]} · {status.upper()} · {source["markets"]} PERP{rejected_text} · scan {age}{market_age}</span>'
         )
     st.markdown(f'<div class="bc-sources">{"".join(pieces)}</div>', unsafe_allow_html=True)
 
@@ -590,6 +592,9 @@ def inspect_contract(market: dict[str, Any], coverage: dict[str, dict[str, list[
             str(market.get("margin_short_source", "")),
         ]
     )
+    funding_proof = html.escape(
+        str(market.get("funding_verification_source", "Contrôle indisponible"))
+    )
     funding_color = "#67e2b0" if market["funding_pct"] >= 0 else "#ff867d"
     st.markdown(
         f"""
@@ -613,6 +618,7 @@ def inspect_contract(market: dict[str, Any], coverage: dict[str, dict[str, list[
             {coverage_card('Margin long', asset_coverage['margin_long'])}
             {coverage_card('Margin short', asset_coverage['margin_short'])}
           </div>
+          <div class="bc-proof"><strong>Validation funding :</strong> {funding_proof}</div>
           <div class="bc-proof"><strong>Preuve catalogue :</strong> {html.escape(proof)}</div>
         </div>
         """,
@@ -643,6 +649,13 @@ def live_dashboard() -> None:
         metric_card("Flux officiels", f"{live_source_count}/3", f"Scan serveur {feed['latency_ms']} ms")
 
     source_badges(feed["sources"])
+    rejected_count = len(feed.get("rejections", []))
+    if rejected_count:
+        st.caption(
+            f"{rejected_count} lecture{'s' if rejected_count != 1 else ''} exclue"
+            f"{'s' if rejected_count != 1 else ''} automatiquement après échec d’un contrôle de cohérence. "
+            "Elles ne participent ni aux alertes, ni aux couvertures, ni à la démo."
+        )
     if feed["mode"] == "hybrid":
         st.markdown('<div class="bc-notice">Une source est dégradée. Son dernier snapshot valide reste visible en PÉRIMÉ et ne déclenche aucune alerte.</div>', unsafe_allow_html=True)
     elif feed["mode"] == "offline":
@@ -769,6 +782,7 @@ def live_dashboard() -> None:
     st.markdown(
         '<div class="bc-footer"><strong>Lecture des signaux :</strong> funding positif → le short PERP reçoit normalement le funding ; funding négatif → le long PERP le reçoit. '
         'L’hypothèse x10 est brute et informative, jamais une condition d’entrée. Sur Kraken, le funding est continu : la borne affichée est la prochaine réalisation horaire, calculée depuis l’horloge serveur et la cadence officielle. '
+        'Chaque funding visible a franchi les contrôles de cohérence propres à sa plateforme ; toute lecture divergente est exclue des alertes et de la démo. '
         'Les disponibilités PERP et margin sont issues des catalogues officiels ; elles ne signifient pas qu’une quantité d’emprunt précise est garantie au moment d’un ordre. '
         '* Kraken EU : catalogue public Futures, éligibilité réglementaire à confirmer selon le compte. Streamlit Community Cloud peut mettre une application inactive en veille.</div>',
         unsafe_allow_html=True,
