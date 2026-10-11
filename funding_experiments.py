@@ -160,7 +160,8 @@ def candidate_routes(
                 None,
             )
             if route is not None:
-                alternatives.append((route, hedge_market))
+                if float(route["net_funding_pct"]) > 0:
+                    alternatives.append((route, hedge_market))
         if not alternatives:
             continue
         alternatives.sort(

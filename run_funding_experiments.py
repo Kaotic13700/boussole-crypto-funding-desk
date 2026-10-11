@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 
 from funding_engine import collect_feed
@@ -58,30 +60,53 @@ def _release_pid_file(path: Path) -> None:
 
 
 def _capture_due(connection, observed_at: int) -> int:
+    due = due_snapshots(connection, observed_at)
+    if not due:
+        return 0
     captured = 0
-    for experiment, offset in due_snapshots(connection, observed_at):
+    requests = []
+    for experiment, offset in due:
         route = json.loads(experiment["route_json"])
-        try:
-            books = fetch_order_books(
-                {
-                    "funding": (
-                        route["funding_exchange"], route["funding_symbol"],
-                        route["funding_contract_value"],
-                    ),
-                    "hedge": (
-                        route["hedge_exchange"], route["hedge_symbol"],
-                        route["hedge_contract_value"],
-                    ),
-                }
-            )
-            captured += int(
-                store_book_snapshot(
-                    connection, experiment["experiment_id"], experiment["deadline_ms"],
-                    offset, now_ms(), books,
+        requests.append((experiment, offset, route))
+
+    def fetch(item):
+        experiment, offset, route = item
+        books = fetch_order_books(
+            {
+                "funding": (
+                    route["funding_exchange"], route["funding_symbol"],
+                    route["funding_contract_value"],
+                ),
+                "hedge": (
+                    route["hedge_exchange"], route["hedge_symbol"],
+                    route["hedge_contract_value"],
+                ),
+            }
+        )
+        return experiment, offset, books
+
+    with ThreadPoolExecutor(max_workers=min(12, len(requests))) as pool:
+        pending = {pool.submit(fetch, item): item for item in requests}
+        for future in as_completed(pending):
+            experiment, offset, _route = pending[future]
+            try:
+                fetched_experiment, fetched_offset, books = future.result()
+                book_time = max(int(book["timestamp"]) for book in books.values())
+                captured += int(
+                    store_book_snapshot(
+                        connection,
+                        fetched_experiment["experiment_id"],
+                        fetched_experiment["deadline_ms"],
+                        fetched_offset,
+                        book_time,
+                        books,
+                    )
                 )
-            )
-        except Exception as error:
-            print(f"snapshot {experiment['experiment_id']} {offset:+d}s: {error}", flush=True)
+            except Exception as error:
+                print(
+                    f"snapshot {experiment['experiment_id']} {offset:+d}s: {error}",
+                    flush=True,
+                )
     return captured
 
 
@@ -114,7 +139,7 @@ def _collect_settlements(connection, observed_at: int) -> int:
     return stored
 
 
-def run_cycle(database: str | Path) -> dict:
+def run_cycle(database: str | Path, capture_due: bool = True) -> dict:
     observed_at = now_ms()
     with connect_database(database) as connection:
         try:
@@ -124,7 +149,7 @@ def run_cycle(database: str | Path) -> dict:
             ]
             candidates = candidate_routes(live_markets, observed_at)
             register_experiments(connection, candidates, observed_at)
-            captured = _capture_due(connection, now_ms())
+            captured = _capture_due(connection, now_ms()) if capture_due else 0
             settlements = _collect_settlements(connection, now_ms())
             record_collector_run(
                 connection, observed_at, len(live_markets), len(candidates),
@@ -143,6 +168,33 @@ def run_cycle(database: str | Path) -> dict:
             raise
 
 
+def _scanner_loop(
+    database: str | Path, stop_event: threading.Event, interval_seconds: int
+) -> None:
+    """Refresh the broad market universe without blocking precise book ticks."""
+    while not stop_event.is_set():
+        started = time.monotonic()
+        try:
+            run_cycle(database, capture_due=False)
+        except Exception as error:
+            print(f"collector scan: {error}", file=sys.stderr, flush=True)
+        stop_event.wait(max(2.0, float(interval_seconds) - (time.monotonic() - started)))
+
+
+def _book_clock_loop(database: str | Path, stop_event: threading.Event) -> None:
+    """Check due offsets every two seconds independently of the full scan."""
+    while not stop_event.is_set():
+        started = time.monotonic()
+        try:
+            with connect_database(database) as connection:
+                captured = _capture_due(connection, now_ms())
+                if captured:
+                    print(f"clock: {captured} carnet(s) enregistré(s)", flush=True)
+        except Exception as error:
+            print(f"collector clock: {error}", file=sys.stderr, flush=True)
+        stop_event.wait(max(0.25, 2.0 - (time.monotonic() - started)))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--database", default=os.environ.get("EXPERIMENT_DATABASE", str(DEFAULT_DATABASE)))
@@ -153,17 +205,26 @@ def main() -> int:
         run_cycle(args.database)
         return 0
     _acquire_pid_file(DEFAULT_PID_FILE)
+    stop_event = threading.Event()
     try:
-        while True:
-            started = time.monotonic()
-            try:
-                run_cycle(args.database)
-            except KeyboardInterrupt:
-                return 0
-            except Exception as error:
-                print(f"collector: {error}", file=sys.stderr, flush=True)
-            time.sleep(max(2, args.interval - (time.monotonic() - started)))
+        scanner = threading.Thread(
+            target=_scanner_loop, args=(args.database, stop_event, args.interval),
+            name="funding-market-scan", daemon=True,
+        )
+        clock = threading.Thread(
+            target=_book_clock_loop, args=(args.database, stop_event),
+            name="funding-book-clock", daemon=True,
+        )
+        scanner.start()
+        clock.start()
+        while scanner.is_alive() and clock.is_alive():
+            scanner.join(timeout=1)
+        return 1
+    except KeyboardInterrupt:
+        stop_event.set()
+        return 0
     finally:
+        stop_event.set()
         _release_pid_file(DEFAULT_PID_FILE)
 
 

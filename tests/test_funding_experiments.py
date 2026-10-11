@@ -58,6 +58,15 @@ def test_candidate_routes_reject_unverifiable_same_window_hedge():
     assert signal_route[0]["hedge_exchange"] == "Bitget"
 
 
+def test_candidate_routes_reject_negative_net_funding_after_hedge():
+    observed = 100_000
+    deadline = observed + 600_000
+    signal = market("signal", "Bitget", -0.04, deadline)
+    more_negative_hedge = market("hedge", "Gate.io", -0.05, deadline)
+    routes = candidate_routes([signal, more_negative_hedge], observed)
+    assert not any(route[0]["funding_market_id"] == "signal" for route in routes)
+
+
 def test_outcome_uses_real_books_settlement_fees_and_leverage():
     database = ":memory:"
     deadline = 1_000_000
