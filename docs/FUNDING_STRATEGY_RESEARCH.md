@@ -76,7 +76,7 @@ actif, sans extrapolation :
   la base, slippage, exécution partielle, meilleur net et pire excursion.
 
 La fenêtre gagnante doit être choisie par quantiles de résultat net, pas par
-moyenne : médiane positive, cinquième percentile acceptable et assez
+moyenne : médiane positive, dixième percentile positif et assez
 d'observations par venue/actif/tranche.
 
 ## 4. Filtres obligatoires avant toute automatisation

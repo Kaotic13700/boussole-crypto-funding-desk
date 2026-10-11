@@ -22,7 +22,7 @@ Application Streamlit de surveillance des fundings perpétuels Bitget, Kraken EU
 - Ouverture autorisée seulement à `±0,50 %` ; la zone `±0,40–0,50 %` reste une surveillance.
 - Prix d’entrée au VWAP, contrôle de profondeur, frais taker configurables et marge liée au levier.
 - Calcul pré-trade du coût aller-retour au carnet visible, du funding net minimum et du signal minimum requis.
-- Fundings Bitget et BloFin crédités uniquement après confirmation de l’historique officiel et d’un prix de marque officiel.
+- Fundings Bitget, BloFin et Gate.io crédités uniquement après confirmation de l’historique officiel et d’un prix de marque officiel.
 - Funding de la couverture compté dans la fenêtre uniquement si son échéance précède ou coïncide avec celle du signal.
 - Clôture des deux jambes au VWAP du carnet courant et journal net des frais.
 ## Lancer localement
@@ -32,6 +32,23 @@ uv run --with-requirements requirements.txt streamlit run streamlit_app.py
 ```
 
 Puis ouvrir `http://localhost:8501`.
+
+### Lancer la validation empirique continue
+
+```powershell
+uv run --with-requirements requirements.txt python run_funding_experiments.py
+```
+
+Le collecteur enregistre les carnets réels autour des échéances dans
+`data/funding_experiments.sqlite3`. Il ne passe aucun ordre. La matrice peut
+être consultée dans l’onglet **Validation empirique** ou exportée avec :
+
+```powershell
+uv run --with-requirements requirements.txt python analyze_funding_experiments.py
+```
+
+La formule, les fenêtres et les critères de validation sont détaillés dans
+`docs/FORWARD_TEST_PROTOCOL.md`.
 
 ## Déploiement Streamlit Community Cloud
 
@@ -54,6 +71,7 @@ Le tableau n’affiche une variation que si deux snapshots du même exchange et 
 - Les métadonnées publiques margin ne garantissent pas la quantité réellement empruntable au moment d’un ordre.
 - L’éligibilité réglementaire Kraken EU doit être confirmée par le compte connecté.
 - Streamlit Community Cloud peut mettre une application inactive en veille.
+- Le collecteur à la seconde doit donc tourner sur une machine ou un worker permanent ; le processus local s’arrête si l’ordinateur s’éteint.
 - Cette version n’accepte aucune clé API et n’exécute aucun ordre.
 - Le cadre de recherche et les conditions d’automatisation sont documentés dans `docs/FUNDING_STRATEGY_RESEARCH.md`.
 

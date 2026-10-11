@@ -14,6 +14,12 @@ import pandas as pd
 import streamlit as st
 
 from funding_engine import collect_feed, market_state
+from funding_experiments import (
+    calculate_outcomes,
+    connect_database,
+    database_status,
+    robust_summary,
+)
 from market_history import apply_24h_changes, load_24h_changes
 from paper_engine import (
     DEFAULT_TAKER_FEE_PCT,
@@ -31,6 +37,7 @@ from paper_market_data import fetch_confirmed_settlements, fetch_order_book, fet
 
 ROOT = Path(__file__).resolve().parent
 LOGO_PATH = ROOT / "boussole-crypto-logo.png"
+EXPERIMENT_DATABASE = ROOT / "data" / "funding_experiments.sqlite3"
 VENUE_LABELS = {
     "Bitget": "Bitget",
     "Kraken": "Kraken EU*",
@@ -1287,8 +1294,99 @@ def demo_dashboard() -> None:
         )
 
 
-scanner_tab, paper_tab = st.tabs(["◈ Scanner live", "◎ Portefeuille démo live"])
+@st.fragment(run_every="10s")
+def validation_dashboard() -> None:
+    st.markdown(
+        '<div class="bc-section-label">Validation empirique · échéances réelles</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="bc-paper"><strong>Banc d’essai PERP/PERP</strong><br>'
+        '<span style="color:#9da7a1;font-size:.78rem">Les carnets sont enregistrés avant et après les '
+        'paiements réels. Le capital est fictif ; les taux réglés, la profondeur, le spread, le slippage, '
+        'la base et les frais sont intégrés. Aucun ordre n’est envoyé.</span></div>',
+        unsafe_allow_html=True,
+    )
+    if not EXPERIMENT_DATABASE.exists():
+        st.info(
+            "Le collecteur permanent n’est pas relié à cet hébergement. Il fonctionne localement, mais "
+            "Streamlit Cloud ne peut pas garantir les captures à T−30 s et T+5 s lorsqu’il se met en veille."
+        )
+        return
+    try:
+        with connect_database(EXPERIMENT_DATABASE) as connection:
+            status = database_status(connection)
+            outcomes = calculate_outcomes(connection)
+            matrix = robust_summary(outcomes)
+    except Exception as error:
+        st.error(f"Journal empirique indisponible : {error}")
+        return
+
+    last_run = status.get("last_run") or {}
+    last_run_ms = int(last_run.get("observed_at_ms") or 0)
+    last_run_text = (
+        datetime.fromtimestamp(last_run_ms / 1_000, tz=timezone.utc).strftime("%d/%m/%Y %H:%M:%S UTC")
+        if last_run_ms else "aucune collecte"
+    )
+    metrics = st.columns(4)
+    metrics[0].metric("Échéances suivies", int(status["experiments"]))
+    metrics[1].metric("Carnets capturés", int(status["snapshots"]))
+    metrics[2].metric("Règlements rapprochés", int(status["settlements"]))
+    metrics[3].metric("Résultats complets", len(outcomes))
+    st.caption(f"Dernier passage du collecteur : {last_run_text}")
+
+    if not matrix:
+        st.warning(
+            "Collecte en cours : aucune combinaison entrée/sortie ne possède encore ses deux carnets "
+            "et tous ses règlements officiels. Aucun seuil de rentabilité n’est inventé."
+        )
+    else:
+        frame = pd.DataFrame(matrix).rename(
+            columns={
+                "venue_pair": "Plateformes",
+                "interval_hours": "Tranche",
+                "entry_offset_seconds": "Entrée (s)",
+                "exit_offset_seconds": "Sortie (s)",
+                "total_notional": "Notionnel",
+                "sample_size": "N",
+                "median_net_usd": "Net médian",
+                "p10_net_usd": "Net P10",
+                "median_break_even_funding_pct": "Funding point mort médian",
+                "p90_break_even_funding_pct": "Funding minimum P90",
+                "p95_break_even_funding_pct": "Funding minimum P95",
+                "win_rate_pct": "Réussite",
+                "profit_factor": "Profit factor",
+                "status": "État",
+            }
+        )
+        st.dataframe(
+            frame,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Tranche": st.column_config.NumberColumn(format="%d h"),
+                "Notionnel": st.column_config.NumberColumn(format="$%.0f"),
+                "Net médian": st.column_config.NumberColumn(format="$%+.2f"),
+                "Net P10": st.column_config.NumberColumn(format="$%+.2f"),
+                "Funding point mort médian": st.column_config.NumberColumn(format="%.4f%%"),
+                "Funding minimum P90": st.column_config.NumberColumn(format="%.4f%%"),
+                "Funding minimum P95": st.column_config.NumberColumn(format="%.4f%%"),
+                "Réussite": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%"),
+                "Profit factor": st.column_config.NumberColumn(format="%.2f"),
+            },
+        )
+    st.caption(
+        "Validation stricte : minimum 30 observations par plateforme, tranche, fenêtre et taille ; "
+        "le 10e percentile du net doit rester positif. Le seuil prudent est le funding point mort P95."
+    )
+
+
+scanner_tab, paper_tab, validation_tab = st.tabs(
+    ["◈ Scanner live", "◎ Portefeuille démo live", "◇ Validation empirique"]
+)
 with scanner_tab:
     live_dashboard()
 with paper_tab:
     demo_dashboard()
+with validation_tab:
+    validation_dashboard()

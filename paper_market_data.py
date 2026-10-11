@@ -221,6 +221,32 @@ def _mark_at_blofin(client: httpx.Client, symbol: str, timestamp: int) -> float 
     return None
 
 
+def _mark_at_gate(client: httpx.Client, symbol: str, timestamp: int) -> float | None:
+    start_seconds = timestamp // 1_000 - 60
+    end_seconds = timestamp // 1_000 + 60
+    response = client.get(
+        "https://api.gateio.ws/api/v4/futures/usdt/candlesticks",
+        params={
+            "contract": f"mark_{symbol}",
+            "from": start_seconds,
+            "to": end_seconds,
+            "interval": "1m",
+        },
+    )
+    response.raise_for_status()
+    rows = response.json()
+    if not isinstance(rows, list):
+        return None
+    target_minute = timestamp // 60_000 * 60
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_time = int(float(row.get("t", 0)))
+        if row_time == target_minute:
+            return _finite(row.get("o"))
+    return None
+
+
 def fetch_confirmed_settlements(
     exchange: str, symbol: str, since_ms: int, until_ms: int
 ) -> list[dict[str, Any]]:
@@ -230,7 +256,7 @@ def fetch_confirmed_settlements(
     exact account-level continuous funding realization. That requires a later
     read-only authenticated connector.
     """
-    if until_ms <= since_ms or exchange in {"Kraken", "Gate.io", "Hyperliquid"}:
+    if until_ms <= since_ms or exchange in {"Kraken", "Hyperliquid"}:
         return []
     with _client() as client:
         if exchange == "Bitget":
@@ -254,13 +280,28 @@ def fetch_confirmed_settlements(
             rows = payload.get("data") or []
             mark_reader = _mark_at_blofin
             source = "API BloFin · historique funding + mark 1m"
+        elif exchange == "Gate.io":
+            response = client.get(
+                "https://api.gateio.ws/api/v4/futures/usdt/funding_rate",
+                params={"contract": symbol, "limit": 100},
+            )
+            response.raise_for_status()
+            rows = response.json()
+            if not isinstance(rows, list):
+                raise ValueError("Historique funding Gate.io indisponible")
+            mark_reader = _mark_at_gate
+            source = "API Gate.io · historique funding + mark 1m"
         else:
             raise ValueError(f"Plateforme non prise en charge: {exchange}")
 
         output: list[dict[str, Any]] = []
         for row in rows:
-            timestamp = int(float(row.get("fundingTime", 0)))
-            rate = _finite(row.get("fundingRate"))
+            timestamp = int(
+                float(row.get("t", 0)) * 1_000
+                if exchange == "Gate.io"
+                else float(row.get("fundingTime", 0))
+            )
+            rate = _finite(row.get("r") if exchange == "Gate.io" else row.get("fundingRate"))
             if rate is None or not (since_ms < timestamp <= until_ms):
                 continue
             mark_price = mark_reader(client, symbol, timestamp)
