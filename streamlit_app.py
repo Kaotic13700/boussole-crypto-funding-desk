@@ -20,6 +20,7 @@ from paper_engine import (
     apply_confirmed_settlements,
     build_perp_routes,
     close_paper_position,
+    estimate_snapshot_round_trip,
     mark_paper_position,
     open_paper_position,
     vwap_for_notional,
@@ -30,7 +31,13 @@ from paper_market_data import fetch_confirmed_settlements, fetch_order_book, fet
 
 ROOT = Path(__file__).resolve().parent
 LOGO_PATH = ROOT / "boussole-crypto-logo.png"
-VENUE_LABELS = {"Bitget": "Bitget", "Kraken": "Kraken EU*", "BloFin": "BloFin"}
+VENUE_LABELS = {
+    "Bitget": "Bitget",
+    "Kraken": "Kraken EU*",
+    "BloFin": "BloFin",
+    "Gate.io": "Gate.io",
+    "Hyperliquid": "Hyperliquid",
+}
 STATE_RANK = {"PÉRIMÉ": -1, "FLUX": 0, "SURVEILLER": 1, "ALERTE": 2}
 
 st.set_page_config(
@@ -178,7 +185,7 @@ st.markdown(
         <div>
           <div class="bc-eyebrow">Boussole Crypto · Market Intelligence</div>
           <div class="bc-title">Funding Desk</div>
-          <p class="bc-subtitle">Scanner PERP 1 h · 4 h · 8 h — Bitget, Kraken EU*, BloFin</p>
+          <p class="bc-subtitle">Scanner PERP 1 h · 4 h · 8 h — Bitget, Kraken EU*, BloFin, Gate.io, Hyperliquid</p>
         </div>
       </div>
       <div class="bc-live"><i></i> FLUX OFFICIELS · QUASI TEMPS RÉEL</div>
@@ -391,7 +398,13 @@ def deadline_source_label(market: dict[str, Any]) -> str:
         return "Kraken · horloge serveur + borne horaire officielle"
     return "Source indisponible"
 
-VENUE_COMPACT_LABELS = {"Bitget": "BG", "Kraken EU*": "KR", "BloFin": "BF"}
+VENUE_COMPACT_LABELS = {
+    "Bitget": "BG",
+    "Kraken EU*": "KR",
+    "BloFin": "BF",
+    "Gate.io": "GT",
+    "Hyperliquid": "HL",
+}
 
 
 def compact_platforms(platforms: list[str]) -> str:
@@ -652,7 +665,7 @@ def live_dashboard() -> None:
     with metric_columns[2]:
         metric_card("Contrats PERP", f"{len(markets):,}".replace(",", " "), "Fenêtres 1 h · 4 h · 8 h")
     with metric_columns[3]:
-        metric_card("Flux officiels", f"{live_source_count}/3", f"Scan serveur {feed['latency_ms']} ms")
+        metric_card("Flux officiels", f"{live_source_count}/5", f"Scan serveur {feed['latency_ms']} ms")
 
     source_badges(feed["sources"])
     st.caption(f"Historique OI/volume 24 h : {history_status}.")
@@ -675,7 +688,11 @@ def live_dashboard() -> None:
     with first_row[1]:
         selected_direction = st.selectbox("Funding", ["Tous", "Positif", "Négatif"], key="direction_filter")
     with first_row[2]:
-        selected_venue = st.selectbox("Plateforme", ["Toutes", "Bitget", "Kraken EU*", "BloFin"], key="venue_filter")
+        selected_venue = st.selectbox(
+            "Plateforme",
+            ["Toutes", "Bitget", "Kraken EU*", "BloFin", "Gate.io", "Hyperliquid"],
+            key="venue_filter",
+        )
     with first_row[3]:
         selected_intervals = st.multiselect("Fenêtres", [1, 4, 8], default=[1, 4, 8], format_func=lambda value: f"{value} h", key="interval_filter")
     with first_row[4]:
@@ -770,7 +787,7 @@ def live_dashboard() -> None:
         st.caption(
             "Variation 24 h : vert = hausse, rouge = baisse ; — signifie que l’historique vérifié n’est pas disponible. "
             "Aucune variation entre deux rafraîchissements n’est utilisée. Les montants Open interest et Volume 24 h sont normalisés en USD à partir des champs officiels. "
-            "Couverture : BG = Bitget · KR = Kraken EU* · BF = BloFin · L/S = long/short · INV/LIN = contrat inverse/linéaire."
+            "Couverture : BG = Bitget · KR = Kraken EU* · BF = BloFin · GT = Gate.io · HL = Hyperliquid · L/S = long/short · INV/LIN = contrat inverse/linéaire."
         )
 
         contract_ids = [market["id"] for market in filtered]
@@ -791,7 +808,7 @@ def live_dashboard() -> None:
         'L’hypothèse x10 est brute et informative, jamais une condition d’entrée. Sur Kraken, le funding est continu : la borne affichée est la prochaine réalisation horaire, calculée depuis l’horloge serveur et la cadence officielle. '
         'Chaque funding visible a franchi les contrôles de cohérence propres à sa plateforme ; toute lecture divergente est exclue des alertes et de la démo. '
         'Les disponibilités PERP et margin sont issues des catalogues officiels ; elles ne signifient pas qu’une quantité d’emprunt précise est garantie au moment d’un ordre. '
-        '* Kraken EU : catalogue public Futures, éligibilité réglementaire à confirmer selon le compte. Streamlit Community Cloud peut mettre une application inactive en veille.</div>',
+        'Hyperliquid est limité à HyperCore et Gate.io au règlement USDT. * Kraken EU : catalogue public Futures, éligibilité réglementaire à confirmer selon le compte. Streamlit Community Cloud peut mettre une application inactive en veille.</div>',
         unsafe_allow_html=True,
     )
 
@@ -834,9 +851,12 @@ def demo_dashboard() -> None:
             "Profil taker standard public. Ajustez ces taux avec les frais réellement appliqués à votre compte ; "
             "chaque position conserve le profil actif lors de son ouverture."
         )
-        fee_columns = st.columns(3)
+        fee_columns = st.columns(5)
         fee_rates: dict[str, float] = {}
-        for column, exchange in zip(fee_columns, ("Bitget", "Kraken", "BloFin")):
+        for column, exchange in zip(
+            fee_columns,
+            ("Bitget", "Kraken", "BloFin", "Gate.io", "Hyperliquid"),
+        ):
             with column:
                 fee_rates[exchange] = float(
                     st.number_input(
@@ -980,6 +1000,7 @@ def demo_dashboard() -> None:
         execution_error: str | None = None
         funding_fill: dict[str, float] | None = None
         hedge_fill: dict[str, float] | None = None
+        round_trip: dict[str, float] | None = None
         try:
             books = {
                 "funding": load_order_book(
@@ -998,6 +1019,9 @@ def demo_dashboard() -> None:
             )
             hedge_fill = vwap_for_notional(
                 books["hedge"], route["hedge_side"], float(total_notional) / 2
+            )
+            round_trip = estimate_snapshot_round_trip(
+                route, float(total_notional), fee_rates, books
             )
         except Exception as error:
             execution_error = str(error)
@@ -1050,6 +1074,33 @@ def demo_dashboard() -> None:
                     "Frais entrée": st.column_config.NumberColumn(format="$%.2f"),
                 },
             )
+            if round_trip is not None:
+                economics = st.columns(4)
+                economics[0].metric(
+                    "Coût A/R au carnet actuel",
+                    f"${round_trip['round_trip_cost']:,.2f}",
+                    help="Deux ouvertures, deux fermetures immédiates, profondeur visible et frais taker.",
+                )
+                economics[1].metric(
+                    "Funding net minimum",
+                    f"{round_trip['break_even_net_funding_pct']:.4f}%",
+                    help="Seuil sur le notionnel d'une jambe, avant coût d'emprunt éventuel.",
+                )
+                economics[2].metric(
+                    "Signal minimum requis",
+                    f"{round_trip['required_signal_capture_pct']:.4f}%",
+                    help="Seuil du signal après prise en compte du funding de la couverture.",
+                )
+                economics[3].metric(
+                    "Net si funding actuel",
+                    f"${round_trip['projected_net_after_snapshot_cost']:,.2f}",
+                    help="Projection à carnet inchangé ; la sortie future reste inconnue.",
+                )
+                st.caption(
+                    "Le coût A/R est mesuré sur les carnets visibles maintenant. Il ne prédit ni la profondeur, "
+                    "ni le spread, ni la base au moment de la sortie. Le coût d'emprunt spot-margin n'est pas "
+                    "injecté sans donnée de compte vérifiée."
+                )
 
         signal_ready = abs(float(route["funding_pct"])) >= 0.5
         required_cash = float(total_notional) / int(leverage) + float(entry_fee_preview or 0)

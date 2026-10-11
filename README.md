@@ -1,6 +1,6 @@
 # Boussole Crypto — Funding Desk
 
-Application Streamlit de surveillance des fundings perpétuels Bitget, Kraken et BloFin.
+Application Streamlit de surveillance des fundings perpétuels Bitget, Kraken EU*, BloFin, Gate.io et Hyperliquid.
 
 ## Fonctionnement
 
@@ -10,7 +10,7 @@ Application Streamlit de surveillance des fundings perpétuels Bitget, Kraken et
 - Alerte à partir de `±0,50 %` et surveillance renforcée à partir de `±0,40 %`.
 - Funding courant Kraken séparé de sa prévision.
 - Formules Kraken distinctes pour les contrats linéaires `PF_` et inverses `PI_`.
-- Échéances Bitget/BloFin fournies par l’exchange ; cadence Kraken dérivée de sa spécification horaire.
+- Échéances Bitget/BloFin/Gate.io fournies par l’exchange ; cadences Kraken et Hyperliquid dérivées de leurs spécifications horaires avec une horloge officielle.
 - Couverture présentée séparément en PERP long, PERP short, margin long et margin short.
 - Conservation temporaire du dernier snapshot valide en cas de panne, marqué `PÉRIMÉ` et exclu des alertes.
 - Aucun spot simple, aucune donnée de marché fictive et aucun ordre réel.
@@ -21,6 +21,7 @@ Application Streamlit de surveillance des fundings perpétuels Bitget, Kraken et
 - Capital fictif, mais entrées et sorties calculées sur les carnets publics réels des deux plateformes.
 - Ouverture autorisée seulement à `±0,50 %` ; la zone `±0,40–0,50 %` reste une surveillance.
 - Prix d’entrée au VWAP, contrôle de profondeur, frais taker configurables et marge liée au levier.
+- Calcul pré-trade du coût aller-retour au carnet visible, du funding net minimum et du signal minimum requis.
 - Fundings Bitget et BloFin crédités uniquement après confirmation de l’historique officiel et d’un prix de marque officiel.
 - Funding de la couverture compté dans la fenêtre uniquement si son échéance précède ou coïncide avec celle du signal.
 - Clôture des deux jambes au VWAP du carnet courant et journal net des frais.
@@ -40,7 +41,7 @@ Le point d’entrée est `streamlit_app.py`. Les dépendances sont épinglées d
 
 Le tableau n’affiche une variation que si deux snapshots du même exchange et du même symbole existent dans deux tranches UTC de cinq minutes espacées exactement de 24 heures.
 
-- `collect_market_history.py` effectue une collecte ponctuelle depuis les trois API officielles.
+- `collect_market_history.py` effectue une collecte ponctuelle depuis les cinq API officielles.
 - `render.yaml` décrit un collecteur Render exécuté toutes les cinq minutes et une base PostgreSQL persistante.
 - Le collecteur et Streamlit reçoivent la chaîne de connexion uniquement via `HISTORY_DATABASE_URL`.
 - Aucune clé de trading, clé privée ou donnée de portefeuille n’est utilisée.
@@ -54,6 +55,7 @@ Le tableau n’affiche une variation que si deux snapshots du même exchange et 
 - L’éligibilité réglementaire Kraken EU doit être confirmée par le compte connecté.
 - Streamlit Community Cloud peut mettre une application inactive en veille.
 - Cette version n’accepte aucune clé API et n’exécute aucun ordre.
+- Le cadre de recherche et les conditions d’automatisation sont documentés dans `docs/FUNDING_STRATEGY_RESEARCH.md`.
 
 - Le journal paper reste attaché à la session Streamlit ; une persistance multi-session exige une base et une identité utilisateur.
 - La liquidation exacte et les contraintes de marge du compte ne sont pas simulées sans connecteur authentifié en lecture seule.

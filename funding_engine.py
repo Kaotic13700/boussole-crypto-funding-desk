@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 import math
 import threading
 import time
@@ -195,6 +196,12 @@ def _json(client: httpx.Client, url: str) -> dict[str, Any]:
     return payload
 
 
+def _json_any(client: httpx.Client, url: str) -> Any:
+    response = client.get(url)
+    response.raise_for_status()
+    return response.json()
+
+
 def _parallel_json(client: httpx.Client, urls: dict[str, str]) -> dict[str, dict[str, Any]]:
     output: dict[str, dict[str, Any]] = {}
     with ThreadPoolExecutor(max_workers=len(urls)) as pool:
@@ -202,6 +209,32 @@ def _parallel_json(client: httpx.Client, urls: dict[str, str]) -> dict[str, dict
         for future in as_completed(futures):
             output[futures[future]] = future.result()
     return output
+
+
+def _post_json_snapshot(
+    client: httpx.Client, url: str, body: dict[str, Any]
+) -> tuple[Any, int]:
+    """POST a public endpoint and retain its HTTP server clock as evidence."""
+    response = client.post(url, json=body)
+    response.raise_for_status()
+    payload = response.json()
+    try:
+        server_ms = int(parsedate_to_datetime(response.headers["date"]).timestamp() * 1000)
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"Horloge HTTP officielle absente pour {url}") from error
+    return payload, server_ms
+
+
+def gate_open_interest_usd(
+    total_size: float | None, quanto_multiplier: float, mark_price: float
+) -> float | None:
+    if total_size is None or min(quanto_multiplier, mark_price) <= 0:
+        return None
+    return total_size * quanto_multiplier * mark_price
+
+
+def next_hour_boundary_ms(timestamp: int) -> int:
+    return (timestamp // 3_600_000 + 1) * 3_600_000
 
 
 def fetch_bitget() -> SourceResult:
@@ -742,6 +775,316 @@ def fetch_blofin() -> SourceResult:
     )
 
 
+def fetch_gateio() -> SourceResult:
+    """Read Gate USDT perpetuals and its public spot-margin catalogue."""
+    base = "https://api.gateio.ws/api/v4"
+    urls = {
+        "contracts": f"{base}/futures/usdt/contracts",
+        "tickers": f"{base}/futures/usdt/tickers",
+        "margin": f"{base}/margin/currency_pairs",
+    }
+    with _client() as client, ThreadPoolExecutor(max_workers=3) as pool:
+        pending = {pool.submit(_json_any, client, url): key for key, url in urls.items()}
+        payloads = {key: future.result() for future, key in pending.items()}
+    contracts = require_list(payloads["contracts"], "Gate.io contrats")
+    tickers = require_list(payloads["tickers"], "Gate.io tickers")
+    margin_rows = require_list(payloads["margin"], "Gate.io margin")
+
+    ticker_by_symbol = {str(row.get("contract", "")): row for row in tickers}
+    margin_by_symbol = {
+        str(row.get("id", "")): row
+        for row in margin_rows
+        if int(finite(row.get("status")) or 0) == 1
+    }
+    received_at = now_ms()
+    markets: list[dict[str, Any]] = []
+    rejections: list[dict[str, Any]] = []
+
+    for contract in contracts:
+        symbol = str(contract.get("name", ""))
+        ticker = ticker_by_symbol.get(symbol)
+        rate = finite(contract.get("funding_rate"))
+        interval_seconds = finite(contract.get("funding_interval"))
+        next_apply_seconds = timestamp_ms(contract.get("funding_next_apply"))
+        if (
+            not symbol
+            or ticker is None
+            or rate is None
+            or interval_seconds is None
+            or next_apply_seconds is None
+            or contract.get("status") != "trading"
+            or contract.get("in_delisting") is True
+            or contract.get("is_pre_market") is True
+        ):
+            continue
+        interval = interval_seconds / 3_600
+        deadline = next_apply_seconds * 1_000
+        if interval not in ALLOWED_INTERVALS or deadline <= received_at:
+            continue
+        funding_pct = rate * 100
+        ticker_rate = ticker.get("funding_rate")
+        if not funding_rates_match(rate, ticker_rate):
+            rejections.append(
+                rejection("Gate.io", symbol, "désaccord contrat ↔ ticker officiel", funding_pct)
+            )
+            continue
+        funding_limit = finite(contract.get("funding_rate_limit"))
+        if funding_limit is not None and abs(rate) > funding_limit + 1e-12:
+            rejections.append(
+                rejection("Gate.io", symbol, "taux hors limite publiée", funding_pct)
+            )
+            continue
+
+        last = finite(ticker.get("last")) or finite(contract.get("last_price")) or 0.0
+        bid = finite(ticker.get("highest_bid"))
+        ask = finite(ticker.get("lowest_ask"))
+        mark_price = finite(ticker.get("mark_price")) or finite(contract.get("mark_price")) or 0.0
+        multiplier = finite(contract.get("quanto_multiplier")) or 0.0
+        if min(last, bid or 0.0, ask or 0.0, mark_price, multiplier) <= 0 or bid >= ask:
+            continue
+        margin = margin_by_symbol.get(symbol) or {}
+        margin_listed = bool(margin)
+        margin_leverage = finite(margin.get("leverage")) if margin_listed else None
+        total_size = finite(ticker.get("total_size"))
+        open_interest_usd = gate_open_interest_usd(total_size, multiplier, mark_price)
+        volume_24h_usd = finite(ticker.get("volume_24h_quote"))
+        volume_24h_native = finite(ticker.get("volume_24h_base"))
+        predicted = finite(ticker.get("funding_rate_indicative"))
+        taker_fee = finite(contract.get("taker_fee_rate"))
+        mid = (bid + ask) / 2
+        asset = normalize_asset(str(margin.get("base") or symbol.removesuffix("_USDT")))
+        markets.append(
+            {
+                "id": f"gateio-{symbol.lower()}",
+                "asset": asset,
+                "symbol": symbol,
+                "exchange": "Gate.io",
+                "direction": "positive" if funding_pct >= 0 else "negative",
+                "funding_pct": funding_pct,
+                "predicted_funding_pct": predicted * 100 if predicted is not None else None,
+                "prediction_source": "API Gate.io · funding_rate_indicative",
+                "funding_basis": "current",
+                "funding_verified": True,
+                "funding_verification_source": "Gate.io contrat + ticker + limite du contrat",
+                "verification_level": "cross-endpoint",
+                "interval_hours": int(interval),
+                "interval_source": "API Gate.io · funding_interval",
+                "next_funding_at": deadline,
+                "deadline_source": "exchange",
+                "perp_price": last,
+                "bid_price": bid,
+                "ask_price": ask,
+                "mark_price": mark_price,
+                "contract_value": multiplier,
+                "spread_bps": (ask - bid) / mid * 10_000,
+                "taker_fee_pct": taker_fee * 100 if taker_fee is not None else None,
+                "fee_source": "API Gate.io · taker_fee_rate du contrat",
+                "margin_long_available": margin_listed,
+                "margin_short_available": margin_listed,
+                "max_margin_leverage": margin_leverage,
+                "depth_usd": volume_24h_usd or 0.0,
+                "open_interest_usd": open_interest_usd,
+                "open_interest_native": (
+                    total_size * multiplier if total_size is not None else None
+                ),
+                "volume_24h_native": volume_24h_native,
+                "volume_24h_usd": volume_24h_usd,
+                "data_status": "live",
+                "updated_at": received_at,
+                "market_data_at": received_at,
+                "market_timestamp_source": "official-http-receipt",
+                "regional_eligibility": "unverified",
+                "perp_long_available": True,
+                "perp_short_available": True,
+                "perp_availability_source": "Catalogue Gate.io Futures USDT · contrat trading",
+                "margin_product_listed": margin_listed,
+                "margin_long_source": (
+                    "Catalogue Gate.io spot margin · paire active (emprunt quote à confirmer au compte)"
+                    if margin_listed
+                    else "Catalogue Gate.io spot margin · paire absente"
+                ),
+                "margin_short_source": (
+                    "Catalogue Gate.io spot margin · paire active (emprunt base à confirmer au compte)"
+                    if margin_listed
+                    else "Catalogue Gate.io spot margin · paire absente"
+                ),
+            }
+        )
+
+    if not markets:
+        raise ValueError("Gate.io: aucun PERP valide après contrôle")
+    markets.sort(key=lambda item: abs(item["funding_pct"]), reverse=True)
+    return SourceResult(
+        "Gate.io",
+        markets,
+        received_at,
+        received_at,
+        "Disponibilité d'emprunt margin à confirmer au niveau du compte.",
+        rejections=rejections,
+    )
+
+
+def fetch_hyperliquid() -> SourceResult:
+    """Read the official HyperCore perpetual universe without inventing a BBO."""
+    endpoint = "https://api.hyperliquid.xyz/info"
+    with _client() as client:
+        payload, server_time = _post_json_snapshot(
+            client, endpoint, {"type": "metaAndAssetCtxs"}
+        )
+    received_at = now_ms()
+    if not fresh_market_timestamp(server_time, received_at, max_age_ms=30_000):
+        raise ValueError("Hyperliquid: horloge HTTP périmée ou incohérente")
+    if not isinstance(payload, list) or len(payload) != 2:
+        raise ValueError("Hyperliquid: réponse metaAndAssetCtxs invalide")
+    meta, contexts = payload
+    universe = meta.get("universe") if isinstance(meta, dict) else None
+    if not isinstance(universe, list) or not isinstance(contexts, list) or len(universe) != len(contexts):
+        raise ValueError("Hyperliquid: univers ou contextes invalides")
+
+    enhanced_symbols = {
+        str(contract.get("name", ""))
+        for contract, context in zip(universe, contexts)
+        if isinstance(contract, dict)
+        and isinstance(context, dict)
+        and (rate := finite(context.get("funding"))) is not None
+        and abs(rate * 100) >= ENHANCED_VERIFICATION_THRESHOLD_PCT
+    }
+    enhanced_confirmation: dict[str, float | None] = {}
+    if enhanced_symbols:
+        with _client() as client:
+            confirmation_payload, confirmation_time = _post_json_snapshot(
+                client, endpoint, {"type": "metaAndAssetCtxs"}
+            )
+        if not fresh_market_timestamp(confirmation_time, now_ms(), max_age_ms=30_000):
+            raise ValueError("Hyperliquid: seconde horloge HTTP invalide")
+        if isinstance(confirmation_payload, list) and len(confirmation_payload) == 2:
+            confirmation_meta, confirmation_contexts = confirmation_payload
+            confirmation_universe = (
+                confirmation_meta.get("universe")
+                if isinstance(confirmation_meta, dict)
+                else None
+            )
+            if isinstance(confirmation_universe, list) and isinstance(confirmation_contexts, list):
+                enhanced_confirmation = {
+                    str(item.get("name", "")): finite(ctx.get("funding"))
+                    for item, ctx in zip(confirmation_universe, confirmation_contexts)
+                    if isinstance(item, dict) and isinstance(ctx, dict)
+                }
+
+    next_funding_at = next_hour_boundary_ms(server_time)
+    markets: list[dict[str, Any]] = []
+    rejections: list[dict[str, Any]] = []
+    for contract, context in zip(universe, contexts):
+        if not isinstance(contract, dict) or not isinstance(context, dict):
+            continue
+        symbol = str(contract.get("name", ""))
+        if not symbol or contract.get("isDelisted") is True:
+            continue
+        rate = finite(context.get("funding"))
+        mark_price = finite(context.get("markPx"))
+        oracle_price = finite(context.get("oraclePx"))
+        mid_price = finite(context.get("midPx")) or mark_price
+        if rate is None or min(mark_price or 0.0, oracle_price or 0.0, mid_price or 0.0) <= 0:
+            continue
+        funding_pct = rate * 100
+        if abs(funding_pct) > 4.0 + 1e-9:
+            rejections.append(
+                rejection("Hyperliquid", symbol, "taux hors plafond officiel ±4 %/h", funding_pct)
+            )
+            continue
+        if symbol in enhanced_symbols and not funding_rates_match(
+            rate,
+            enhanced_confirmation.get(symbol),
+            absolute_tolerance=1e-5,
+            relative_tolerance=1e-3,
+        ):
+            rejections.append(
+                rejection(
+                    "Hyperliquid",
+                    symbol,
+                    "seconde lecture officielle non concordante",
+                    funding_pct,
+                )
+            )
+            continue
+        open_interest_native = finite(context.get("openInterest"))
+        open_interest_usd = (
+            open_interest_native * oracle_price
+            if open_interest_native is not None
+            else None
+        )
+        volume_24h_usd = finite(context.get("dayNtlVlm"))
+        volume_24h_native = finite(context.get("dayBaseVlm"))
+        markets.append(
+            {
+                "id": f"hyperliquid-{symbol.lower()}",
+                "asset": normalize_asset(symbol),
+                "symbol": symbol,
+                "exchange": "Hyperliquid",
+                "direction": "positive" if funding_pct >= 0 else "negative",
+                "funding_pct": funding_pct,
+                "predicted_funding_pct": None,
+                "prediction_source": "not-published-by-exchange",
+                "funding_basis": "current-hour",
+                "funding_verified": True,
+                "funding_verification_source": (
+                    "Hyperliquid metaAndAssetCtxs relu + plafond protocolaire"
+                    if symbol in enhanced_symbols
+                    else "Hyperliquid metaAndAssetCtxs + plafond protocolaire"
+                ),
+                "verification_level": (
+                    "enhanced-double-read"
+                    if symbol in enhanced_symbols
+                    else "official-snapshot+protocol-cap"
+                ),
+                "interval_hours": 1,
+                "interval_source": "Protocole Hyperliquid · paiement horaire",
+                "next_funding_at": next_funding_at,
+                "deadline_source": "protocol-hour+http-server-clock",
+                "perp_price": mid_price,
+                "bid_price": None,
+                "ask_price": None,
+                "mark_price": mark_price,
+                "oracle_price": oracle_price,
+                "contract_value": 1.0,
+                "spread_bps": None,
+                "taker_fee_pct": 0.045,
+                "fee_source": "Barème perp public de base ; taux exact dépend du compte",
+                "margin_long_available": False,
+                "margin_short_available": False,
+                "max_margin_leverage": None,
+                "depth_usd": volume_24h_usd or 0.0,
+                "open_interest_usd": open_interest_usd,
+                "open_interest_native": open_interest_native,
+                "volume_24h_native": volume_24h_native,
+                "volume_24h_usd": volume_24h_usd,
+                "data_status": "live",
+                "updated_at": received_at,
+                "market_data_at": server_time,
+                "market_timestamp_source": "official-http-server-clock",
+                "regional_eligibility": "unverified",
+                "perp_long_available": True,
+                "perp_short_available": True,
+                "perp_availability_source": "Catalogue Hyperliquid HyperCore · PERP actif",
+                "margin_product_listed": False,
+                "margin_long_source": "Aucun spot margin assimilé au PERP HyperCore",
+                "margin_short_source": "Aucun spot margin assimilé au PERP HyperCore",
+            }
+        )
+
+    if not markets:
+        raise ValueError("Hyperliquid: aucun PERP valide après contrôle")
+    markets.sort(key=lambda item: abs(item["funding_pct"]), reverse=True)
+    return SourceResult(
+        "Hyperliquid",
+        markets,
+        received_at,
+        server_time,
+        "HyperCore uniquement ; aucun spot simple n'est injecté dans le scanner.",
+        rejections=rejections,
+    )
+
+
 def _source_health(result: SourceResult, fetched_at: int, status: str, message: str | None = None) -> dict[str, Any]:
     return {
         "exchange": result.exchange,
@@ -763,9 +1106,11 @@ def collect_feed() -> dict[str, Any]:
         "Bitget": fetch_bitget,
         "Kraken": fetch_kraken,
         "BloFin": fetch_blofin,
+        "Gate.io": fetch_gateio,
+        "Hyperliquid": fetch_hyperliquid,
     }
     completed: dict[str, SourceResult | Exception] = {}
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=len(fetchers)) as pool:
         futures = {pool.submit(fetcher): exchange for exchange, fetcher in fetchers.items()}
         for future in as_completed(futures):
             exchange = futures[future]
@@ -780,7 +1125,8 @@ def collect_feed() -> dict[str, Any]:
     rejections: list[dict[str, Any]] = []
     live_sources = 0
 
-    for exchange in ("Bitget", "Kraken", "BloFin"):
+    source_order = ("Bitget", "Kraken", "BloFin", "Gate.io", "Hyperliquid")
+    for exchange in source_order:
         result = completed[exchange]
         if isinstance(result, SourceResult):
             live_sources += 1
@@ -837,7 +1183,7 @@ def collect_feed() -> dict[str, Any]:
             item["exchange"],
         )
     )
-    mode = "live" if live_sources == 3 else "hybrid" if live_sources > 0 else "offline"
+    mode = "live" if live_sources == len(fetchers) else "hybrid" if live_sources > 0 else "offline"
     return {
         "mode": mode,
         "markets": markets,

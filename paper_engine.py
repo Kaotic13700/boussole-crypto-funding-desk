@@ -7,7 +7,13 @@ when both legs have a live price in the exchange feed.
 from __future__ import annotations
 
 from typing import Any
-DEFAULT_TAKER_FEE_PCT = {"Bitget": 0.06, "Kraken": 0.05, "BloFin": 0.06}
+DEFAULT_TAKER_FEE_PCT = {
+    "Bitget": 0.06,
+    "Kraken": 0.05,
+    "BloFin": 0.06,
+    "Gate.io": 0.075,
+    "Hyperliquid": 0.045,
+}
 
 
 def executable_top_price(market: dict[str, Any], side: str, action: str) -> float:
@@ -100,6 +106,74 @@ def vwap_for_quantity(
         "quantity": executed_quantity,
         "notional": executed_notional,
         "slippage_bps": max(0.0, adverse_move / top_price * 10_000),
+    }
+
+
+def estimate_snapshot_round_trip(
+    route: dict[str, Any],
+    total_notional: float,
+    fee_rates_pct: dict[str, float],
+    books: dict[str, dict[str, Any]],
+) -> dict[str, float]:
+    """Price an immediate two-leg round trip from the same live snapshots.
+
+    This is an executable-now cost floor, not a forecast of the future exit
+    book. It includes both bid/ask crossings, visible depth and four taker fees.
+    """
+    if total_notional <= 0:
+        raise ValueError("Notionnel strictement positif requis")
+    leg_notional = float(total_notional) / 2
+    funding_open = vwap_for_notional(
+        books["funding"], route["funding_side"], leg_notional, "open"
+    )
+    hedge_open = vwap_for_notional(
+        books["hedge"], route["hedge_side"], leg_notional, "open"
+    )
+    funding_close = vwap_for_quantity(
+        books["funding"], route["funding_side"], funding_open["quantity"], "close"
+    )
+    hedge_close = vwap_for_quantity(
+        books["hedge"], route["hedge_side"], hedge_open["quantity"], "close"
+    )
+    funding_direction = 1 if route["funding_side"] == "long" else -1
+    hedge_direction = 1 if route["hedge_side"] == "long" else -1
+    market_pnl = (
+        funding_direction
+        * funding_open["quantity"]
+        * (funding_close["price"] - funding_open["price"])
+        + hedge_direction
+        * hedge_open["quantity"]
+        * (hedge_close["price"] - hedge_open["price"])
+    )
+    funding_fee_pct = float(fee_rates_pct[route["funding_exchange"]])
+    hedge_fee_pct = float(fee_rates_pct[route["hedge_exchange"]])
+    entry_fees = (
+        funding_open["notional"] * funding_fee_pct
+        + hedge_open["notional"] * hedge_fee_pct
+    ) / 100
+    exit_fees = (
+        funding_close["notional"] * funding_fee_pct
+        + hedge_close["notional"] * hedge_fee_pct
+    ) / 100
+    round_trip_cost = entry_fees + exit_fees - market_pnl
+    break_even_net_funding_pct = round_trip_cost / leg_notional * 100
+    hedge_capture_pct = float(route.get("hedge_capture_cashflow_pct") or 0)
+    required_signal_capture_pct = break_even_net_funding_pct - hedge_capture_pct
+    projected_funding_income = leg_notional * float(route["net_funding_pct"]) / 100
+    return {
+        "leg_notional": leg_notional,
+        "entry_fees": entry_fees,
+        "exit_fees": exit_fees,
+        "market_round_trip_pnl": market_pnl,
+        "round_trip_cost": round_trip_cost,
+        "break_even_net_funding_pct": break_even_net_funding_pct,
+        "required_signal_capture_pct": required_signal_capture_pct,
+        "projected_funding_income": projected_funding_income,
+        "projected_net_after_snapshot_cost": projected_funding_income - round_trip_cost,
+        "funding_open_slippage_bps": funding_open["slippage_bps"],
+        "hedge_open_slippage_bps": hedge_open["slippage_bps"],
+        "funding_close_slippage_bps": funding_close["slippage_bps"],
+        "hedge_close_slippage_bps": hedge_close["slippage_bps"],
     }
 def funding_cashflow(quantity: float, mark_price: float, funding_pct: float, side: str) -> float:
     if min(quantity, mark_price) <= 0:

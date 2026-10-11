@@ -4,11 +4,13 @@ from funding_engine import (
     SourceResult,
     fresh_market_timestamp,
     funding_rates_match,
+    gate_open_interest_usd,
     kraken_open_interest_usd,
     kraken_published_relative_pct,
     kraken_relative_funding_pct,
     market_state,
     normalize_asset,
+    next_hour_boundary_ms,
     within_caps,
 )
 
@@ -31,6 +33,16 @@ def test_kraken_open_interest_normalization() -> None:
     assert kraken_open_interest_usd("PI_XBTUSD", 2_000_000, 80_000) == pytest.approx(2_000_000)
     assert kraken_open_interest_usd("PF_XBTUSD", 10, 80_000) == pytest.approx(800_000)
     assert kraken_open_interest_usd("PF_XBTUSD", None, 80_000) is None
+
+
+def test_gate_open_interest_uses_contract_multiplier() -> None:
+    assert gate_open_interest_usd(1_000_000, 0.0001, 80_000) == pytest.approx(8_000_000)
+    assert gate_open_interest_usd(None, 0.0001, 80_000) is None
+
+
+def test_hyperliquid_next_funding_is_next_utc_hour() -> None:
+    assert next_hour_boundary_ms(3_600_000) == 7_200_000
+    assert next_hour_boundary_ms(7_199_999) == 7_200_000
 
 
 

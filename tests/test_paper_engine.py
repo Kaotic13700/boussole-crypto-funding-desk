@@ -4,6 +4,7 @@ from paper_engine import (
     apply_confirmed_settlements,
     build_perp_routes,
     close_paper_position,
+    estimate_snapshot_round_trip,
     funding_cashflow,
     funding_cashflow_pct,
     leg_pnl,
@@ -121,6 +122,28 @@ def test_open_position_uses_book_vwap_and_taker_fees() -> None:
     assert position["funding_entry_price"] < 100
     assert position["hedge_entry_price"] > 100
     assert position["entry_fee"] == pytest.approx(2.2)
+
+
+def test_snapshot_round_trip_includes_spreads_depth_and_four_fees() -> None:
+    route = route_by_funding_id(
+        build_perp_routes([market("a", "Bitget", 0.6), market("b", "BloFin", 0.1)]),
+        "a",
+    )
+    estimate = estimate_snapshot_round_trip(
+        route,
+        4_000,
+        {"Bitget": 0.05, "BloFin": 0.05},
+        {
+            "funding": flat_book(100, 101),
+            "hedge": flat_book(99, 100),
+        },
+    )
+    assert estimate["entry_fees"] == pytest.approx(2.0)
+    assert estimate["market_round_trip_pnl"] == pytest.approx(-40.0)
+    assert estimate["round_trip_cost"] == pytest.approx(44.0)
+    assert estimate["break_even_net_funding_pct"] == pytest.approx(2.2)
+    assert estimate["required_signal_capture_pct"] == pytest.approx(2.3)
+    assert estimate["projected_net_after_snapshot_cost"] == pytest.approx(-34.0)
 
 
 def test_mark_to_market_uses_executable_prices_and_both_projected_fundings() -> None:

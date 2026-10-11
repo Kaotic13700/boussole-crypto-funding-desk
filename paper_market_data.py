@@ -62,6 +62,23 @@ def _levels(raw: Any, multiplier: float) -> list[tuple[float, float]]:
     return parsed
 
 
+def _object_levels(
+    raw: Any, price_key: str, quantity_key: str, multiplier: float
+) -> list[tuple[float, float]]:
+    parsed: list[tuple[float, float]] = []
+    if not isinstance(raw, list):
+        return parsed
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        price = _finite(row.get(price_key))
+        quantity = _finite(row.get(quantity_key))
+        if price is None or quantity is None or price <= 0 or quantity <= 0:
+            continue
+        parsed.append((price, quantity * multiplier))
+    return parsed
+
+
 def fetch_order_book(exchange: str, symbol: str, contract_value: float = 1.0) -> dict[str, Any]:
     """Return a normalized, fresh public book with quantities in base asset."""
     with _client() as client:
@@ -103,14 +120,57 @@ def fetch_order_book(exchange: str, symbol: str, contract_value: float = 1.0) ->
             data = rows[0]
             timestamp = int(float(data.get("ts", 0)))
             multiplier = float(contract_value)
+        elif exchange == "Gate.io":
+            payload = _get_json(
+                client,
+                "https://api.gateio.ws/api/v4/futures/usdt/order_book"
+                f"?contract={symbol}&limit=100&with_id=true",
+            )
+            data = payload
+            timestamp = int(float(data.get("current", 0)) * 1_000)
+            multiplier = float(contract_value)
+            asks = sorted(
+                _object_levels(data.get("asks"), "p", "s", multiplier),
+                key=lambda level: level[0],
+            )
+            bids = sorted(
+                _object_levels(data.get("bids"), "p", "s", multiplier),
+                key=lambda level: level[0],
+                reverse=True,
+            )
+        elif exchange == "Hyperliquid":
+            response = client.post(
+                "https://api.hyperliquid.xyz/info",
+                json={"type": "l2Book", "coin": symbol, "nSigFigs": 5},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Carnet Hyperliquid indisponible")
+            data = payload
+            timestamp = int(float(data.get("time", 0)))
+            levels = data.get("levels")
+            if not isinstance(levels, list) or len(levels) != 2:
+                raise ValueError("Carnet Hyperliquid invalide")
+            bids = sorted(
+                _object_levels(levels[0], "px", "sz", 1.0),
+                key=lambda level: level[0],
+                reverse=True,
+            )
+            asks = sorted(
+                _object_levels(levels[1], "px", "sz", 1.0),
+                key=lambda level: level[0],
+            )
+            multiplier = 1.0
         else:
             raise ValueError(f"Plateforme non prise en charge: {exchange}")
 
     age_ms = _now_ms() - timestamp
     if timestamp <= 0 or age_ms < -5_000 or age_ms > MAX_BOOK_AGE_MS:
         raise ValueError(f"Carnet {exchange} périmé")
-    asks = sorted(_levels(data.get("asks"), multiplier), key=lambda level: level[0])
-    bids = sorted(_levels(data.get("bids"), multiplier), key=lambda level: level[0], reverse=True)
+    if exchange not in {"Gate.io", "Hyperliquid"}:
+        asks = sorted(_levels(data.get("asks"), multiplier), key=lambda level: level[0])
+        bids = sorted(_levels(data.get("bids"), multiplier), key=lambda level: level[0], reverse=True)
     if not asks or not bids or bids[0][0] >= asks[0][0]:
         raise ValueError(f"Carnet {exchange} vide ou croisé")
     return {"exchange": exchange, "symbol": symbol, "timestamp": timestamp, "asks": asks, "bids": bids}
@@ -170,7 +230,7 @@ def fetch_confirmed_settlements(
     exact account-level continuous funding realization. That requires a later
     read-only authenticated connector.
     """
-    if until_ms <= since_ms or exchange == "Kraken":
+    if until_ms <= since_ms or exchange in {"Kraken", "Gate.io", "Hyperliquid"}:
         return []
     with _client() as client:
         if exchange == "Bitget":
