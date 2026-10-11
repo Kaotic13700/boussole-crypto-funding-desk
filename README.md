@@ -4,7 +4,8 @@ Application Streamlit de surveillance des fundings perpétuels Bitget, Kraken et
 
 ## Fonctionnement
 
-- Open interest et volume 24 h issus des API officielles, normalisés en USD et colorés selon leur variation entre deux scans.
+- Open interest et volume 24 h issus des API officielles, normalisés en USD.
+- Variations OI/volume issues de deux snapshots officiels espacés exactement de 24 h ; aucune interpolation et aucun delta entre rafraîchissements.
 - Feed public officiel des PERP 1 h, 4 h et 8 h.
 - Alerte à partir de `±0,50 %` et surveillance renforcée à partir de `±0,40 %`.
 - Funding courant Kraken séparé de sa prévision.
@@ -34,6 +35,17 @@ Puis ouvrir `http://localhost:8501`.
 ## Déploiement Streamlit Community Cloud
 
 Le point d’entrée est `streamlit_app.py`. Les dépendances sont épinglées dans `requirements.txt` et le thème se trouve dans `.streamlit/config.toml`.
+
+### Historique OI et volume sur 24 h
+
+Le tableau n’affiche une variation que si deux snapshots du même exchange et du même symbole existent dans deux tranches UTC de cinq minutes espacées exactement de 24 heures.
+
+- `collect_market_history.py` effectue une collecte ponctuelle depuis les trois API officielles.
+- `render.yaml` décrit un collecteur Render exécuté toutes les cinq minutes et une base PostgreSQL persistante.
+- Le collecteur et Streamlit reçoivent la chaîne de connexion uniquement via `HISTORY_DATABASE_URL`.
+- Aucune clé de trading, clé privée ou donnée de portefeuille n’est utilisée.
+- La rétention est limitée à 72 heures.
+- Les pourcentages commencent à apparaître 24 heures après le démarrage continu de la collecte. Avant cela, l’interface affiche `—`.
 
 ## Limites importantes
 

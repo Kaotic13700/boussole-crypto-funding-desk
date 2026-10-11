@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import hashlib
 import html
+import os
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ import pandas as pd
 import streamlit as st
 
 from funding_engine import collect_feed, market_state
+from market_history import apply_24h_changes, load_24h_changes
 from paper_engine import (
     DEFAULT_TAKER_FEE_PCT,
     apply_confirmed_settlements,
@@ -189,6 +191,22 @@ st.markdown(
 @st.cache_data(ttl=2.4, max_entries=1, show_spinner=False)
 def load_feed() -> dict[str, Any]:
     return collect_feed()
+
+
+def history_database_url() -> str:
+    environment_value = os.environ.get("HISTORY_DATABASE_URL", "").strip()
+    if environment_value:
+        return environment_value
+    try:
+        return str(st.secrets.get("HISTORY_DATABASE_URL", "")).strip()
+    except Exception:
+        return ""
+
+
+@st.cache_data(ttl=60, max_entries=1, show_spinner=False)
+def load_market_history_changes(_database_url: str) -> dict[tuple[str, str], dict[str, Any]]:
+    return load_24h_changes(_database_url)
+
 
 @st.cache_data(ttl=1.2, max_entries=64, show_spinner=False)
 def load_order_book(exchange: str, symbol: str, contract_value: float) -> dict[str, Any]:
@@ -604,8 +622,21 @@ def inspect_contract(market: dict[str, Any], coverage: dict[str, dict[str, list[
 @st.fragment(run_every="3s")
 def live_dashboard() -> None:
     feed = load_feed()
-    markets = feed["markets"]
     current_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    database_url = history_database_url()
+    history_status = "en attente de connexion"
+    history_changes: dict[tuple[str, str], dict[str, Any]] = {}
+    if database_url:
+        try:
+            history_changes = load_market_history_changes(database_url)
+            history_status = (
+                f"{len(history_changes):,} comparaisons exactes disponibles".replace(",", " ")
+                if history_changes
+                else "collecte en cours · 24 h nécessaires"
+            )
+        except Exception:
+            history_status = "stockage momentanément indisponible"
+    markets = apply_24h_changes(feed["markets"], history_changes)
     coverage = coverage_by_asset(markets)
     logo_index = load_logo_index()
     alert_count = sum(market_state(item["funding_pct"], item["data_status"]) == "ALERTE" for item in markets)
@@ -624,6 +655,7 @@ def live_dashboard() -> None:
         metric_card("Flux officiels", f"{live_source_count}/3", f"Scan serveur {feed['latency_ms']} ms")
 
     source_badges(feed["sources"])
+    st.caption(f"Historique OI/volume 24 h : {history_status}.")
     rejected_count = len(feed.get("rejections", []))
     if rejected_count:
         st.caption(
